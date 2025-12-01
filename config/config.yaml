@@ -1,0 +1,145 @@
+# --- General Parameters (can be overridden for specific samples) ---
+threads: 16
+flank_size: 150
+min_mapq: 0
+min_coverage_ratio: 0.8
+negative_ratios:
+  bg: 2.0
+
+training:
+  epochs: 50
+  batch_size: 32
+  learning_rate: 0.0001
+  test_size: 0.15
+  exclude_for_training: ["rice"]
+
+e2e_training:
+  plant_backbone_path: "model/final_plant_backbone"  # backbone模型保存在这里
+  epochs: 10
+  batch_size: 4
+  backbone_lr: 1e-5
+  head_lr: 1e-4
+  hidden_dim: 256
+  dropout: 0.3
+  num_gpus: 1
+  gpu_ids: "3" 
+
+# --- Prediction Workflow Parameters ---
+prediction:
+  # 定义你要预测的样本。ID可以是你喜欢的任何标识符。
+  samples: ["rice_pred"]
+  
+  # 为每个样本ID指定输入文件
+  inputs:
+    rice_pred: "/homeb/xuminghua/sine_attention/rice_sine_predict.tsv" # 你的输入TSV文件路径
+  
+  # 指定用于预测的已训练好的模型
+  trained_model: "/homeb/xuminghua/hisine_classifier/data/model/no_freeze/final_model/checkpoint_epoch_5.pt"
+
+sine_ref: data/Dfam_RepBase/SINE.fa
+
+negative_refs:
+  DNA: "data/Dfam_RepBase/DNA.fa"
+  LTR: "data/Dfam_RepBase/LTR.fa"
+  TIR: "data/Dfam_RepBase/TIR.fa"
+
+negative_ratios:
+  bg: 1.0   # 背景负样本 = 正样本数 × 1.0；如果你暂时只想用 TE 负样本，可以改成 0
+# --- Sample Definitions ---
+# This section defines all the species/samples to be processed.
+# Snakemake will iterate over the keys of this dictionary.
+
+root_dir: /homeb/xuminghua/data/genomes
+
+samples:
+  soybean:
+    genome: /homeb/xuminghua/data/genomes/plants/Glycine_max-soybean/GCF_000004515.6_Glycine_max_v4.0_genomic.fna
+    cds: /homeb/xuminghua/data/genomes/plants/Glycine_max-soybean/GCF_000004515.6_Glycine_max_v4.0_cds_from_genomic.fna
+    gff: /homeb/xuminghua/data/genomes/plants/Glycine_max-soybean/GCF_000004515.6_Glycine_max_v4.0_genomic.gff
+
+  rice:
+    genome: /homeb/xuminghua/data/genomes/plants/Oryza_sativa-Japanese_rice/GCF_034140825.1_ASM3414082v1_genomic.fna
+    cds: /homeb/xuminghua/data/genomes/plants/Oryza_sativa-Japanese_rice/GCF_034140825.1_ASM3414082v1_cds_from_genomic.fna
+    gff: /homeb/xuminghua/data/genomes/plants/Oryza_sativa-Japanese_rice/GCF_034140825.1_ASM3414082v1_genomic.gff
+
+  opium_poppy:
+    genome: /homeb/xuminghua/data/genomes/plants/Papaver_somniferum-opium_poppy/GCF_003573695.1_ASM357369v1_genomic.fna
+    cds: /homeb/xuminghua/data/genomes/plants/Papaver_somniferum-opium_poppy/GCF_003573695.1_ASM357369v1_cds_from_genomic.fna
+    gff: /homeb/xuminghua/data/genomes/plants/Papaver_somniferum-opium_poppy/GCF_003573695.1_ASM357369v1_genomic.gff
+
+  thale_cress:
+    genome: /homeb/xuminghua/data/genomes/plants/Arabidopsis_thaliana-thale_cress/GCF_000001735.4_TAIR10.1_genomic.fna
+    cds: /homeb/xuminghua/data/genomes/plants/Arabidopsis_thaliana-thale_cress/GCF_000001735.4_TAIR10.1_cds_from_genomic.fna
+    gff: /homeb/xuminghua/data/genomes/plants/Arabidopsis_thaliana-thale_cress/GCF_000001735.4_TAIR10.1_genomic.gff
+
+  cotton:
+    genome: /homeb/xuminghua/data/genomes/plants/Gossypium_hirsutum-cotton/GCF_007990345.1_Gossypium_hirsutum_v2.1_genomic.fna
+    cds: /homeb/xuminghua/data/genomes/plants/Gossypium_hirsutum-cotton/GCF_007990345.1_Gossypium_hirsutum_v2.1_cds_from_genomic.fna
+    gff: /homeb/xuminghua/data/genomes/plants/Gossypium_hirsutum-cotton/GCF_007990345.1_Gossypium_hirsutum_v2.1_genomic.gff
+
+  mung_bean:
+    genome: /homeb/xuminghua/data/genomes/plants/Vigna_radiata-mung_bean/GCF_000741045.1_Vradiata_ver6_genomic.fna
+    cds: /homeb/xuminghua/data/genomes/plants/Vigna_radiata-mung_bean/GCF_000741045.1_Vradiata_ver6_cds_from_genomic.fna
+    gff: /homeb/xuminghua/data/genomes/plants/Vigna_radiata-mung_bean/GCF_000741045.1_Vradiata_ver6_genomic.gff
+
+  Capsicum_annuum:
+    genome: /homeb/xuminghua/data/genomes/plants/Capsicum_annuum/GCF_002878395.1_UCD10Xv1.1_genomic.fna
+    cds: /homeb/xuminghua/data/genomes/plants/Capsicum_annuum/GCF_002878395.1_UCD10Xv1.1_cds_from_genomic.fna
+    gff: /homeb/xuminghua/data/genomes/plants/Capsicum_annuum/GCF_002878395.1_UCD10Xv1.1_genomic.gff
+
+  apple:
+    genome: /homeb/xuminghua/data/genomes/plants/Malus_domestica-apple/GCF_042453785.1_GDT2T_hap1_genomic.fna
+    cds: /homeb/xuminghua/data/genomes/plants/Malus_domestica-apple/GCF_042453785.1_GDT2T_hap1_cds_from_genomic.fna
+    gff: /homeb/xuminghua/data/genomes/plants/Malus_domestica-apple/GCF_042453785.1_GDT2T_hap1_genomic.gff
+
+  black_cottonwood:
+    genome: /homeb/xuminghua/data/genomes/plants/Populus_trichocarpa-black_cottonwood/GCF_000002775.5_P.trichocarpa_v4.1_genomic.fna
+    cds: /homeb/xuminghua/data/genomes/plants/Populus_trichocarpa-black_cottonwood/GCF_000002775.5_P.trichocarpa_v4.1_cds_from_genomic.fna
+    gff: /homeb/xuminghua/data/genomes/plants/Populus_trichocarpa-black_cottonwood/GCF_000002775.5_P.trichocarpa_v4.1_genomic.gff
+
+  wine_grape:
+    genome: /homeb/xuminghua/data/genomes/plants/Vitis_vinifera-wine_grape/GCF_030704535.1_ASM3070453v1_genomic.fna
+    cds: /homeb/xuminghua/data/genomes/plants/Vitis_vinifera-wine_grape/GCF_030704535.1_ASM3070453v1_cds_from_genomic.fna
+    gff: /homeb/xuminghua/data/genomes/plants/Vitis_vinifera-wine_grape/GCF_030704535.1_ASM3070453v1_genomic.gff
+
+  European_chestnut:
+    genome: /homeb/xuminghua/data/genomes/plants/Castanea_sativa-European_chestnut/GCF_040712315.1_ASM4071231v1_genomic.fna
+    cds: /homeb/xuminghua/data/genomes/plants/Castanea_sativa-European_chestnut/GCF_040712315.1_ASM4071231v1_cds_from_genomic.fna
+    gff: /homeb/xuminghua/data/genomes/plants/Castanea_sativa-European_chestnut/GCF_040712315.1_ASM4071231v1_genomic.gff
+
+  barrel_medic:
+    genome: /homeb/xuminghua/data/genomes/plants/Medicago_truncatula-barrel_medic/GCF_003473485.1_MtrunA17r5.0-ANR_genomic.fna
+    cds: /homeb/xuminghua/data/genomes/plants/Medicago_truncatula-barrel_medic/GCF_003473485.1_MtrunA17r5.0-ANR_cds_from_genomic.fna
+    gff: /homeb/xuminghua/data/genomes/plants/Medicago_truncatula-barrel_medic/GCF_003473485.1_MtrunA17r5.0-ANR_genomic.gff
+
+  pear:
+    genome: /homeb/xuminghua/data/genomes/plants/Pyrus_communis-pear/GCF_963583255.1_drPyrComm1.1_genomic.fna
+    cds: /homeb/xuminghua/data/genomes/plants/Pyrus_communis-pear/GCF_963583255.1_drPyrComm1.1_cds_from_genomic.fna
+    gff: /homeb/xuminghua/data/genomes/plants/Pyrus_communis-pear/GCF_963583255.1_drPyrComm1.1_genomic.gff
+
+  maize:
+    genome: /homeb/xuminghua/data/genomes/plants/Zea_mays/GCF_902167145.1_Zm-B73-REFERENCE-NAM-5.0_genomic.fna
+    cds: /homeb/xuminghua/data/genomes/plants/Zea_mays/GCF_902167145.1_Zm-B73-REFERENCE-NAM-5.0_cds_from_genomic.fna
+    gff: /homeb/xuminghua/data/genomes/plants/Zea_mays/GCF_902167145.1_Zm-B73-REFERENCE-NAM-5.0_genomic.gff
+
+  cucumber:
+    genome: /homeb/xuminghua/data/genomes/plants/Cucumis_sativus-cucumber/GCF_000004075.3_Cucumber_9930_V3_genomic.fna
+    cds: /homeb/xuminghua/data/genomes/plants/Cucumis_sativus-cucumber/GCF_000004075.3_Cucumber_9930_V3_cds_from_genomic.fna
+    gff: /homeb/xuminghua/data/genomes/plants/Cucumis_sativus-cucumber/GCF_000004075.3_Cucumber_9930_V3_genomic.gff
+
+  dessert_banana:
+    genome: /homeb/xuminghua/data/genomes/plants/Musa_acuminata-dessert_banana/GCF_036884655.1_Cavendish_Baxijiao_AAA_genomic.fna
+    cds: /homeb/xuminghua/data/genomes/plants/Musa_acuminata-dessert_banana/GCF_036884655.1_Cavendish_Baxijiao_AAA_cds_from_genomic.fna
+    gff: /homeb/xuminghua/data/genomes/plants/Musa_acuminata-dessert_banana/GCF_036884655.1_Cavendish_Baxijiao_AAA_genomic.gff
+
+  English_oak:
+    genome: /homeb/xuminghua/data/genomes/plants/Quercus_robur-English_oak/GCF_932294415.1_dhQueRobu3.1_genomic.fna
+    cds: /homeb/xuminghua/data/genomes/plants/Quercus_robur-English_oak/GCF_932294415.1_dhQueRobu3.1_cds_from_genomic.fna
+    gff: /homeb/xuminghua/data/genomes/plants/Quercus_robur-English_oak/GCF_932294415.1_dhQueRobu3.1_genomic.gff
+
+  bread_wheat:
+    genome: /homeb/xuminghua/data/genomes/plants/Triticum_aestivum-bread_wheat/GCF_018294505.1_IWGSC_CS_RefSeq_v2.1_genomic.fna
+    cds: /homeb/xuminghua/data/genomes/plants/Triticum_aestivum-bread_wheat/GCF_018294505.1_IWGSC_CS_RefSeq_v2.1_cds_from_genomic.fna
+    gff: /homeb/xuminghua/data/genomes/plants/Triticum_aestivum-bread_wheat/GCF_018294505.1_IWGSC_CS_RefSeq_v2.1_genomic.gff
+
+prediction_samples: []
