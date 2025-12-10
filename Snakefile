@@ -9,6 +9,9 @@ SINE Classifier Snakemake Workflow - 端到端版本
 3. ✅ 训练直接使用FASTA + Motif坐标
 4. ✅ 简化的流程，更清晰
 """
+import sys
+import os
+sys.path.insert(0, '/homeb/xuminghua/hisine_classifier')
 
 configfile: "config/config.yaml"
 
@@ -33,25 +36,47 @@ rule all:
 rule extract_positives:
     input:
         genome=lambda wildcards: config["samples"][wildcards.species]["genome"],
-        sine_ref=config["sine_ref"]
+        sine_ref=config["sine_ref"],
+        # 需要其他的库来做交叉验证
+        dna_ref=config["negative_refs"]["DNA"],
+        ltr_ref=config["negative_refs"]["LTR"],
+        tir_ref=config["negative_refs"]["TIR"]
     output:
         tsv="results/{species}/positives/samples.tsv",
         fa="results/{species}/positives/samples.fa"
     params:
-        prefix="results/{species}/positives/samples"
+        # 先生成到临时文件，清洗后再覆盖到 output
+        raw_prefix="results/{species}/positives/raw_samples",
+        final_prefix="results/{species}/positives/samples"
     threads: config["threads"]
     log: "logs/{species}/extract_positives.log"
     shell:
         """
+        # 1. 原始提取 (输出到 raw_samples.tsv/.fa)
         python scripts/01_extract_positives.py \
             --genome {input.genome} \
             --sine_ref {input.sine_ref} \
-            --out_prefix {params.prefix} \
+            --out_prefix {params.raw_prefix} \
             --threads {threads} \
             --flank {config[flank_size]} \
             --cov_thr {config[min_coverage_ratio]} \
             --min_as_score 50 \
-            --max_de_divergence 0.25 > {log} 2>&1
+            --max_de_divergence 0.25 >> {log} 2>&1
+        
+        echo "------------------------------------------------" >> {log}
+        echo "开始交叉比对清洗 (Cross-Check Contamination)..." >> {log}
+
+        # 2. 交叉清洗 (输入 raw，输出到 final: samples.tsv/.fa)
+        python tools/remove_contamination.py \
+            --input_fa {params.raw_prefix}.fa \
+            --input_tsv {params.raw_prefix}.tsv \
+            --neg_refs {input.dna_ref} {input.ltr_ref} {input.tir_ref} \
+            --out_prefix {params.final_prefix} \
+            --threads {threads} \
+            --cov_thr 0.6 >> {log} 2>&1
+            
+        # 3. 清理 raw 文件 (可选)
+        # rm {params.raw_prefix}.fa {params.raw_prefix}.tsv {params.raw_prefix}.sam
         """
 
 
@@ -212,13 +237,12 @@ rule train_e2e_sine_classifier:
             else ""
         ),
         epochs=config["e2e_training"]["epochs"],
+        freeze_epochs=config["e2e_training"]["freeze_epochs"],       # 前 n-1 轮冻结，第 n 轮开始解冻
         batch_size=config["e2e_training"]["batch_size"],
         backbone_lr=config["e2e_training"]["backbone_lr"],
         head_lr=config["e2e_training"]["head_lr"],
         hidden_dim=config["e2e_training"]["hidden_dim"],
         dropout=config["e2e_training"]["dropout"],
-        # 新增: 是否冻结backbone
-        freeze_backbone=config["e2e_training"].get("freeze_backbone", "false")
     threads: 32
     resources:
         gpu=config["e2e_training"]["num_gpus"]
@@ -239,12 +263,13 @@ rule train_e2e_sine_classifier:
             --output_dir {params.output_dir} \
             --split_dir {params.split_dir} \
             --epochs {params.epochs} \
+            --freeze_epochs {params.freeze_epochs} \
             --batch_size {params.batch_size} \
             --backbone_lr {params.backbone_lr} \
             --head_lr {params.head_lr} \
             --hidden_dim {params.hidden_dim} \
-            --dropout {params.dropout} \
-            $freeze_flag > {log} 2>&1
+            --dropout {params.dropout} 
+            > {log} 2>&1
         """
 
 

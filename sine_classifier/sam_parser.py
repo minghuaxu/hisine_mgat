@@ -11,10 +11,51 @@ sam_parser.py (TE-friendly Version)
 
 import re
 from typing import List, Dict, Any, Optional
-
+import math
+from collections import Counter
 from pyfaidx import Fasta
 from sine_classifier.utils import revcomp
 
+def calculate_complexity(seq: str, k: int = 2) -> float:
+    """计算 k-mer 香农熵"""
+    if len(seq) < k: return 0.0
+    kmers = [seq[i:i+k] for i in range(len(seq) - k + 1)]
+    total = len(kmers)
+    counts = Counter(kmers)
+    entropy = 0.0
+    for count in counts.values():
+        p = count / total
+        entropy -= p * math.log2(p)
+    # 归一化 (最大熵 = log2(4^k))
+    max_entropy = math.log2(min(total, 4**k))
+    return entropy / max_entropy if max_entropy > 0 else 0.0
+
+def is_simple_repeat(seq: str) -> bool:
+    """
+    判断是否为简单重复序列 (Low Complexity)
+    标准:
+    1. 2-mer 熵过低 (检测 (AT)n, (CT)n 等)
+    2. 3-mer 熵过低 (检测 (ATG)n 等)
+    3. 单一碱基占比过高 (检测 PolyA/T，但也可能是 SINE 尾巴，需谨慎)
+    """
+    seq = seq.upper()
+    if len(seq) < 30: return False # 太短的不处理
+    
+    # 1. 熵检测
+    # 阈值 0.5 是比较保守的，正常 DNA > 0.8
+    # 微卫星通常 < 0.4
+    if calculate_complexity(seq, k=2) < 0.5: return True
+    if calculate_complexity(seq, k=3) < 0.5: return True
+    
+    # 2. 周期性检测 (简化版)
+    # 检测 1-6bp 的强周期性
+    n = len(seq)
+    for p in range(1, 7):
+        matches = sum(1 for i in range(n-p) if seq[i] == seq[i+p])
+        if matches / (n-p) > 0.8: # 80% 的自相似性
+            return True
+            
+    return False
 
 def _calculate_aln_len_from_cigar(cigar: str) -> int:
     """
@@ -98,12 +139,16 @@ def parse_sam_and_extract_seqs(
         "kept": 0,
         "failed_mapq": 0,
         "failed_cov": 0,
+        "failed_len": 0,
         "failed_as": 0,
         "failed_div": 0,
         "unmapped": 0,
     }
 
     print("[INFO] Starting SAM parsing...")
+
+    # 增加计数器
+    stats["failed_complexity"] = 0
 
     with open(sam_filepath, "r") as f:
         for line in f:
@@ -142,6 +187,15 @@ def parse_sam_and_extract_seqs(
             # 2. 覆盖度过滤（对 TE 拷贝完整性更关键）
             if coverage < min_coverage_ratio:
                 stats["failed_cov"] += 1
+                continue
+
+            # 绝对长度过滤 
+            # SINE 通常在 100bp - 500bp 之间
+            # 60bp 的序列通常是碎片，不足以包含完整特征
+            MIN_ALIGNMENT_LENGTH = 100
+
+            if aln_len < MIN_ALIGNMENT_LENGTH:
+                stats["failed_len"] += 1
                 continue
 
             # 3. 解析可选标签（AS/dv/de 等）
@@ -210,6 +264,11 @@ def parse_sam_and_extract_seqs(
                     final_right = right_flank
                     final_core = core_seq
 
+                # 复杂度过滤
+                if is_simple_repeat(str(final_core)):
+                    stats["failed_complexity"] += 1
+                    continue
+
                 records.append({
                     "chrom": rname,
                     "start": start,
@@ -231,6 +290,7 @@ def parse_sam_and_extract_seqs(
     print("=" * 40)
     print(f"Total alignments in SAM:   {stats['total']}")
     print(f"Unmapped (*):              {stats['unmapped']}")
+    print(f"Failed Complexity:           {stats['failed_complexity']}")
 
     if min_mapq is not None:
         print(f"Failed MAPQ (<{min_mapq}):         {stats['failed_mapq']}")
@@ -238,6 +298,7 @@ def parse_sam_and_extract_seqs(
         print(f"Failed MAPQ:                {stats['failed_mapq']} (filter disabled)")
 
     print(f"Failed Coverage (<{min_coverage_ratio:.2f}): {stats['failed_cov']}")
+    print(f"Failed Length (<{MIN_ALIGNMENT_LENGTH}bp):   {stats['failed_len']}")
 
     if min_as_score is not None:
         print(f"Failed AS Score (<{min_as_score}):      {stats['failed_as']}")

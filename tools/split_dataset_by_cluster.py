@@ -55,7 +55,7 @@ def run_cdhit(input_fasta, output_prefix, threshold=0.8, threads=8):
         "-n", str(word_size),
         "-d", "0",  # 关键：使用完整header，方便后续解析
         "-T", str(threads),
-        "-M", "16000" # 16GB RAM limit
+        "-M", "32000" # 16GB RAM limit
     ]
     
     print(f"[CMD] {' '.join(cmd)}")

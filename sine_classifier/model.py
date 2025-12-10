@@ -16,6 +16,44 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class MotifConfidenceModule(nn.Module):
+    """
+    裁判员模块：判断这个 Motif 到底是不是真的
+    """
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()  # 输出 0~1，表示"这是真Motif的概率"
+        )
+    
+    def forward(self, hidden_states, motif_mask):
+        """
+        hidden_states: (Batch, Seq_Len, Dim) - Backbone输出的特征
+        motif_mask: (Batch, Seq_Len) - detect_motifs.py 给出的原始Mask
+        """
+        # 1. 提取 Motif 区域的特征
+        # 我们只关心 Mask > 0 的区域
+        # 为了简单，我们可以计算加权平均特征
+        
+        # 扩展 mask 维度以匹配 hidden_states: (Batch, Seq_Len, 1)
+        mask_expanded = motif_mask.unsqueeze(-1)
+        
+        # 加权求和: (Batch, Dim)
+        # 只有 Motif 区域有值，其他区域为0
+        motif_region_features = (hidden_states * mask_expanded).sum(dim=1)
+        
+        # 计算分母（防止除以0），得到平均特征
+        mask_sum = mask_expanded.sum(dim=1).clamp(min=1e-9)
+        motif_region_embedding = motif_region_features / mask_sum
+        
+        # 2. 裁判打分 (Batch, 1)
+        confidence = self.net(motif_region_embedding)
+        
+        return confidence
+
 class MotifAwareAttention(nn.Module):
     """
     Motif感知的注意力层
@@ -124,7 +162,8 @@ class MotifGuidedSINEClassifier(nn.Module):
             num_heads=8,
             dropout=dropout
         )
-        
+        # 置信度模块
+        self.confidence_module = MotifConfidenceModule(self.backbone_dim)
         # 分类头
         self.classifier = nn.Sequential(
             nn.Linear(self.backbone_dim, hidden_dim),
@@ -169,11 +208,17 @@ class MotifGuidedSINEClassifier(nn.Module):
             output_hidden_states=True
         )
         hidden_states = outputs.hidden_states[-1]
+
+        # 计算 Motif 的置信度，告诉模型：虽然 detect_motifs.py 说这里有 motif，但你（模型）觉得它是真的概率是多少？
+        confidence_score = self.confidence_module(hidden_states, motif_mask) # (B, 1)
+
+        # 动态修正 Mask，如果模型觉得这个 Motif 很假（confidence=0.1），原本的 Mask 就会变弱
+        refined_motif_mask = motif_mask * confidence_score # (B, L) * (B, 1) -> (B, L)
         
         # 2. Motif感知注意力
         enhanced_states = self.motif_attention(
             hidden_states, 
-            motif_mask, 
+            refined_motif_mask, 
             attention_mask=attention_mask
         )
         
@@ -248,11 +293,16 @@ class FocalLoss(nn.Module):
         self.reduction = reduction
     
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        # CE 期望 targets 是 LongTensor (N,)
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')  # (N,)
         p_t = torch.exp(-ce_loss)
-        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+
+        # 显式转换为 float，避免类型混淆
+        targets_float = targets.float()
+        alpha_t = self.alpha * targets_float + (1 - self.alpha) * (1 - targets_float)
+
         focal_loss = alpha_t * (1 - p_t) ** self.gamma * ce_loss
-        
+
         if self.reduction == 'mean':
             return focal_loss.mean()
         elif self.reduction == 'sum':

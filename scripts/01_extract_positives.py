@@ -89,7 +89,7 @@ def main():
     build_index_cmd = [
         "minimap2",
         "-d", mm2_idx_path,
-        "-k", "12",
+        "-k", "19",
         "-w", "5",
         str(genome_path)
     ]
@@ -99,14 +99,31 @@ def main():
     # 2. 运行 minimap2 进行比对（这里不再写 -k/-w，避免覆盖索引参数）
     sam_filepath = f"{args.out_prefix}.sam"
     print(f"[信息] 正在运行 minimap2，将 {args.sine_ref} 比对到 {genome_path}...")
+    # minimap2_cmd = [
+    #     "minimap2",
+    #     "-a",
+    #     # -k/-w 已经固化在索引里，这里不要再写
+    #     "-p", "0.5",           # 次要比对的得分阈值。保留得分至少为主比对 50% 的结果
+    #     "-N", "50000",         # 最多保留 50000 个比对（高拷贝家族）
+    #     "--secondary=yes",     # 输出次要比对记录
+    #     "--score-N=0",         # 对 N 碱基不惩罚
+    #     "-t", str(args.threads),
+    #     mm2_idx_path,
+    #     args.sine_ref
+    # ]
     minimap2_cmd = [
         "minimap2",
-        "-a",
-        # -k/-w 已经固化在索引里，这里不要再写
-        "-p", "0.5",           # 次要比对的得分阈值。保留得分至少为主比对 50% 的结果
-        "-N", "50000",         # 最多保留 50000 个比对（高拷贝家族）
-        "--secondary=yes",     # 输出次要比对记录
-        "--score-N=0",         # 对 N 碱基不惩罚
+        "-a",                    # 输出 SAM（必须）
+        "--for-only",               # 只比对正链（参考是正链）
+        "--end-bonus=10",        # 强烈推荐！救回大量 5'/3' 端截断的真实插入
+        "-A", "2",               # match bonus
+        "-B", "4",               # mismatch penalty（适中）
+        "-O", "6",               # gap open
+        "-E", "1",               # gap extension
+        "-p", "0.85",            # 次级比对至少 85% 主得分
+        "-N", "100",             # 只保留最好的 100 个（足够了，配合 -p 0.85 后基本都是好比对）
+        "--secondary=yes",
+        "--score-N=0",
         "-t", str(args.threads),
         mm2_idx_path,
         args.sine_ref

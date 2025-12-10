@@ -14,8 +14,9 @@ training:
   exclude_for_training: ["rice"]
 
 e2e_training:
-  plant_backbone_path: "model/final_plant_backbone"  # backbone模型保存在这里
-  epochs: 10
+  plant_backbone_path: "/homeb/xuminghua/hisine_classifier/model/final_plant_backbone_500m/final_plant_backbone"  # backbone模型保存在这里
+  epochs: 20
+  freeze_epochs: 6
   batch_size: 4
   backbone_lr: 1e-5
   head_lr: 1e-4
@@ -34,7 +35,7 @@ prediction:
     rice_pred: "/homeb/xuminghua/sine_attention/rice_sine_predict.tsv" # 你的输入TSV文件路径
   
   # 指定用于预测的已训练好的模型
-  trained_model: "/homeb/xuminghua/hisine_classifier/data/model/no_freeze/final_model/checkpoint_epoch_5.pt"
+  trained_model: "/homeb/xuminghua/hisine_classifier/model/final_plant_backbone_500m/best_model.pt"
 
 sine_ref: data/Dfam_RepBase/SINE.fa
 

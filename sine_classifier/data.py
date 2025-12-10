@@ -53,6 +53,8 @@ class SINEDatasetE2E(Dataset):
         self.is_training = labels is not None
         
         self.motif_data = motif_df.set_index('unique_id', drop=False)
+        self.mask_dropratio = 0.3 # Mask Drop率
+        self.mask_Smoothing = True # Mask平滑
         
         if self.is_training:
             assert len(sequences_with_ids) == len(labels)
@@ -71,7 +73,7 @@ class SINEDatasetE2E(Dataset):
             'background': (0.2, 0.4) # 背景提升到 0.3 左右，避免过度抑制
         }
         
-        print(f"[INFO] SINE Dataset 加载完成 (Mask Dropout=0.7, Smoothing=ON)")
+        print(f"[INFO] SINE Dataset 加载完成 (Mask Dropout={self.mask_dropratio}, Smoothing={self.mask_Smoothing})")
 
     def __len__(self):
         return len(self.sequences_with_ids)
@@ -93,7 +95,7 @@ class SINEDatasetE2E(Dataset):
         try:
             motif_coords = self.motif_data.loc[unique_id]
             # 传入 is_training 标志以启用动态权重
-            base_mask = self._create_base_level_mask(seq_len, motif_coords)
+            base_mask = self._create_base_level_mask(seq_len, motif_coords, self.mask_Smoothing)
         except KeyError:
             # 默认背景值也稍微动态化
             bg_val = 0.3
@@ -152,13 +154,12 @@ class SINEDatasetE2E(Dataset):
             else:
                 token_mask[token_idx] = 0.3
 
-        # ==================== 7. Mask Dropout (修改为 0.7) ====================
+        # ==================== 7. Mask Dropout ====================
         if self.is_training:
             rand_val = np.random.rand()
             
-            # [修改点] 将概率阈值提高到 0.7
-            # 70% 的概率抹平 Mask，迫使模型看序列
-            if rand_val < 0.7:
+            # 一定的概率抹平 Mask，迫使模型看序列
+            if rand_val < self.mask_dropratio:
                 # 使用当前的背景值范围均值作为“平坦”值
                 flat_val = sum(self.weight_ranges['background']) / 2
                 
@@ -167,7 +168,7 @@ class SINEDatasetE2E(Dataset):
                 token_mask.fill_(flat_val)
                 token_mask[is_padding] = 0.0
                 
-            # 另外 30% 的概率，保留 Mask (但已经在 _create_base_level_mask 里加入了抖动和平滑)
+            # 另外的概率，保留 Mask (但已经在 _create_base_level_mask 里加入了抖动和平滑)
             # 这里可以额外再加一点点高斯噪声，防止过拟合精确的浮点数
             else:
                 noise = torch.randn_like(token_mask) * 0.1
@@ -187,7 +188,7 @@ class SINEDatasetE2E(Dataset):
         
         return result
 
-    def _create_base_level_mask(self, seq_len: int, motif_coords: pd.Series) -> np.ndarray:
+    def _create_base_level_mask(self, seq_len: int, motif_coords: pd.Series, Smoothing=True) -> np.ndarray:
         """
         创建带有动态权重和高斯平滑的 Mask
         """
@@ -229,8 +230,9 @@ class SINEDatasetE2E(Dataset):
         
         # 3. 应用高斯平滑 (Soft Masking)
         # Sigma 值也可以微调：训练时稍微大一点增加模糊度，预测时标准一点
-        sigma = 3.0 if self.is_training else 2.0
-        mask = gaussian_kernel_smooth(mask, sigma=sigma)
+        if Smoothing:
+            sigma = 3.0 if self.is_training else 2.0
+            mask = gaussian_kernel_smooth(mask, sigma=sigma)
         
         return mask
 

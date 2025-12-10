@@ -71,12 +71,12 @@ def main():
     parser.add_argument("--output_prefix", required=True, help="输出前缀")
     
     # 预测参数
-    parser.add_argument("--batch_size", type=int, default=8, help="批次大小")
+    parser.add_argument("--batch_size", type=int, default=2, help="批次大小")
     parser.add_argument("--max_length", type=int, default=512, help="最大序列长度")
-    parser.add_argument("--threshold", type=float, default=0.99, help="SINE判定阈值")
+    parser.add_argument("--threshold", type=float, default=0.5, help="SINE判定阈值")
 
     # 指定显卡
-    parser.add_argument("--gpu", type=int, default=3, help="使用的GPU编号")
+    parser.add_argument("--gpu", type=int, default=2, help="使用的GPU编号")
     
     args = parser.parse_args()
     
@@ -101,6 +101,9 @@ def main():
 
         if 'model_state_dict' in state_dict:
             state_dict = state_dict['model_state_dict'] # 处理 checkpoint 包含多个部分的情况
+        elif 'model_state' in state_dict:
+            state_dict = state_dict['model_state']
+
         
         # 检查是否包含 module. 前缀
         if any(k.startswith('module.') for k in state_dict.keys()):
