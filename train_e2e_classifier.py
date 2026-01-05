@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+04_train_e2e_classifier.py (Fixed Multi-Task)
+=============================================
+修复内容：
+1. 添加 --train_motif_tsv 参数以适配新 Data.py
+2. 修复 Evaluate 函数签名，传入两个 Loss
+3. 修复 Optimizer，加入 token_classifier 参数
+4. 修复 Loss 定义和 Batch 解包
+"""
 import argparse
 import logging
-# 屏蔽 Transformers 的警告
 from transformers import logging as tf_logging
 tf_logging.set_verbosity_error()
 import os
@@ -29,7 +37,6 @@ from sine_classifier.model import MotifGuidedSINEClassifier, FocalLoss
 logger = logging.getLogger(__name__)
 
 def revcomp(s):
-    """DNA 反向互补"""
     if pd.isna(s) or s == "": return ""
     return str(Seq(s).reverse_complement())
 
@@ -71,7 +78,6 @@ def set_backbone_freeze(model, freeze: bool):
         param.requires_grad = not freeze
 
 def process_csv_to_data_list(csv_path, rank):
-    """辅助函数：统一处理 CSV 读取逻辑"""
     if rank == 0: logger.info(f"Processing data from: {csv_path}")
     df = pd.read_csv(csv_path)
     sequences_with_ids = []
@@ -84,7 +90,6 @@ def process_csv_to_data_list(csv_path, rank):
         strand = row['strand']
         label = int(row['label'])
         
-        # 必须与 build_masks.py 逻辑一致
         uid = f"{chrom}:{start}-{end}({strand})"
         
         if strand == '-':
@@ -98,7 +103,10 @@ def process_csv_to_data_list(csv_path, rank):
     return sequences_with_ids, labels
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device, rank, world_size):
+def evaluate(model, loader, criterion_cls, criterion_seg, device, rank, world_size):
+    """
+    [修复] 接收两个 Loss 函数，计算总 Loss
+    """
     model.eval()
     total_loss = 0.0
     all_preds = []
@@ -113,18 +121,29 @@ def evaluate(model, loader, criterion, device, rank, world_size):
         attention_mask = batch['attention_mask'].to(device)
         motif_mask = batch['motif_mask'].to(device)
         labels = batch['label'].to(device)
+        token_labels = batch['token_labels'].to(device) # [修复] 解包 Token Labels
 
-        logits = model(input_ids, attention_mask, motif_mask)
-        loss = criterion(logits, labels)
+        # [修复] 接收两个输出
+        global_logits, token_logits = model(input_ids, attention_mask, motif_mask)
+
+        # Loss 1: 全局分类
+        loss_cls = criterion_cls(global_logits, labels)
+
+        # Loss 2: 序列分割 (Flatten计算)
+        loss_seg = criterion_seg(token_logits.view(-1, 5), token_labels.view(-1))
+
+        # 组合 Loss
+        loss = loss_cls + 0.5 * loss_seg 
         total_loss += loss.item()
 
-        probs = torch.softmax(logits, dim=1)
-        preds = torch.argmax(logits, dim=1)
+        probs = torch.softmax(global_logits, dim=1)
+        preds = torch.argmax(global_logits, dim=1)
 
         all_probs.append(probs.cpu())
         all_preds.append(preds.cpu())
         all_labels.append(labels.cpu())
 
+    # 聚合逻辑保持不变...
     if len(all_probs) > 0:
         all_probs = torch.cat(all_probs)
         all_preds = torch.cat(all_preds)
@@ -141,32 +160,33 @@ def evaluate(model, loader, criterion, device, rank, world_size):
         
         sizes = [s.item() for s in size_list]
         max_size = max(sizes)
-        total_samples = sum(sizes)
         
-        if total_samples == 0:
-            return 0.0, 0.0, 0.0, 0.0
+        if sum(sizes) == 0: return 0.0, 0.0, 0.0, 0.0
 
+        # Gather Probs
         prob_buffer = torch.zeros((max_size, 2), dtype=all_probs.dtype, device=device)
         prob_buffer[:local_size] = all_probs.to(device)
         gathered_probs = [torch.zeros_like(prob_buffer) for _ in range(world_size)]
         dist.all_gather(gathered_probs, prob_buffer)
         
+        # Gather Preds
         pred_buffer = torch.zeros((max_size,), dtype=all_preds.dtype, device=device)
         pred_buffer[:local_size] = all_preds.to(device)
         gathered_preds = [torch.zeros_like(pred_buffer) for _ in range(world_size)]
         dist.all_gather(gathered_preds, pred_buffer)
         
+        # Gather Labels
         label_buffer = torch.zeros((max_size,), dtype=all_labels.dtype, device=device)
         label_buffer[:local_size] = all_labels.to(device)
         gathered_labels = [torch.zeros_like(label_buffer) for _ in range(world_size)]
         dist.all_gather(gathered_labels, label_buffer)
         
+        # Reduce Loss
         loss_tensor = torch.tensor([total_loss], device=device)
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-        total_loss_global = loss_tensor.item()
         batch_count_tensor = torch.tensor([len(loader)], device=device)
         dist.all_reduce(batch_count_tensor, op=dist.ReduceOp.SUM)
-        avg_loss = total_loss_global / batch_count_tensor.item()
+        avg_loss = loss_tensor.item() / batch_count_tensor.item()
 
         if rank == 0:
             final_probs = []
@@ -200,14 +220,17 @@ def evaluate(model, loader, criterion, device, rank, world_size):
     return avg_loss, acc, f1, auc
 
 def main():
-    parser = argparse.ArgumentParser(description="SINE Train (Pre-split)")
+    parser = argparse.ArgumentParser(description="SINE Train (Multi-Task)")
     parser.add_argument("--backbone_path", required=True)
     
-    # === 修改处: 明确指定 Train 和 Val 的文件路径 ===
     parser.add_argument("--train_csv", required=True)
     parser.add_argument("--train_mask", required=True)
     parser.add_argument("--val_csv", required=True)
     parser.add_argument("--val_mask", required=True)
+    
+    # [新增] 必须传入 TSV 路径，否则 Dataset 会报错
+    parser.add_argument("--train_motif_tsv", required=True, help="Path to train_motif_pos.tsv")
+    parser.add_argument("--val_motif_tsv", required=True, help="Path to val_motif_pos.tsv")
     
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--epochs", type=int, default=20)
@@ -226,13 +249,12 @@ def main():
 
     if rank == 0:
         logger.info("="*60)
-        logger.info(f"启动训练 (Pre-split Mode): Epochs={args.epochs}, Freeze={args.freeze_epochs}")
+        logger.info(f"启动训练 (Multi-Task: Cls + Seg): Epochs={args.epochs}")
         logger.info("="*60)
 
-    # 1. 加载 Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.backbone_path, trust_remote_code=True)
 
-    # 2. 分别加载 Train 和 Val 数据
+    # 加载 CSV 数据
     X_train, y_train = process_csv_to_data_list(args.train_csv, rank)
     X_val, y_val = process_csv_to_data_list(args.val_csv, rank)
 
@@ -240,13 +262,14 @@ def main():
         logger.info(f"训练集大小: {len(X_train)}")
         logger.info(f"验证集大小: {len(X_val)}")
 
-    # 3. 初始化 Dataset (使用各自的 mask 文件)
+    # [修复] 初始化 Dataset (传入 motif_tsv_path)
     if rank == 0: logger.info("Initializing Datasets...")
     
     train_ds = SINEDatasetE2E(
         sequences_with_ids=X_train,
         labels=y_train,
-        mask_path=args.train_mask,  # <--- 使用 train_masks.pt
+        mask_path=args.train_mask,
+        motif_tsv_path=args.train_motif_tsv, # 传入 TSV
         tokenizer=tokenizer,
         max_token_length=args.max_length,
         is_training=True
@@ -256,12 +279,12 @@ def main():
         sequences_with_ids=X_val,
         labels=y_val,
         mask_path=args.val_mask,
+        motif_tsv_path=args.val_motif_tsv,   # 传入 TSV
         tokenizer=tokenizer,
         max_token_length=args.max_length,
         is_training=False
     )
 
-    # 4. 加载模型
     backbone = AutoModelForMaskedLM.from_pretrained(args.backbone_path, trust_remote_code=True)
     model = MotifGuidedSINEClassifier(
         backbone=backbone,
@@ -270,9 +293,8 @@ def main():
         dropout=args.dropout,
         freeze_backbone=True
     ).to(device)
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False) # 建议设为 False 除非有未用参数
 
-    # 5. Dataloaders
     train_sampler = DistributedSampler(train_ds, shuffle=True)
     val_sampler = DistributedSampler(val_ds, shuffle=False)
 
@@ -281,32 +303,37 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, sampler=val_sampler,
                             num_workers=4, pin_memory=True, collate_fn=collate_fn)
 
-    # 6. Loss & Optimizer
+    # [新增] 定义两个 Loss
+    # Loss 1: 分类 Loss
     if len(y_train) > 0:
         alpha = 0.25
-        criterion = FocalLoss(gamma=2.0, alpha=alpha).to(device)
+        criterion_cls = FocalLoss(gamma=2.0, alpha=alpha).to(device)
     else:
-        criterion = nn.CrossEntropyLoss().to(device)
+        criterion_cls = nn.CrossEntropyLoss().to(device)
+
+    # Loss 2: 分割 Loss (忽略 Padding=4)
+    # 类别: 0=Bg, 1=TSD, 2=Body, 3=PolyA, 4=Pad
+    criterion_seg = nn.CrossEntropyLoss(ignore_index=4).to(device)
 
     best_val_f1 = 0.0
+    
+    # [修复] Optimizer: 必须包含 token_classifier
     optimizer = torch.optim.AdamW([
         {'params': model.module.backbone.parameters(), 'lr': args.backbone_lr, 'weight_decay': 0.01},
         {'params': model.module.motif_attention.parameters(), 'lr': args.head_lr, 'weight_decay': 0.1},
         {'params': model.module.classifier.parameters(), 'lr': args.head_lr, 'weight_decay': 0.1},
+        {'params': model.module.token_classifier.parameters(), 'lr': args.head_lr, 'weight_decay': 0.1}, # 新增
         {'params': getattr(model.module, 'confidence_module', nn.ModuleList()).parameters(), 
         'lr': args.head_lr, 'weight_decay': 0.1}
     ])
 
-    scaler = torch.cuda.amp.GradScaler()
-
-    # 7. 训练循环
     for epoch in range(1, args.epochs + 1):
-        # 冻结/解冻逻辑
         if epoch == 1 and args.freeze_epochs > 0:
             set_backbone_freeze(model, freeze=True)
             optimizer = torch.optim.AdamW([
                 {'params': model.module.motif_attention.parameters(), 'lr': args.head_lr},
                 {'params': model.module.classifier.parameters(), 'lr': args.head_lr},
+                {'params': model.module.token_classifier.parameters(), 'lr': args.head_lr}, # 新增
                 {'params': getattr(model.module, 'confidence_module', nn.ModuleList()).parameters(), 'lr': args.head_lr},
             ], weight_decay=0.1)
             if rank == 0: logger.info("Phase 1: 冻结 Backbone")
@@ -317,6 +344,7 @@ def main():
                 {'params': model.module.backbone.parameters(), 'lr': args.backbone_lr, 'weight_decay': 0.01},
                 {'params': model.module.motif_attention.parameters(), 'lr': args.head_lr, 'weight_decay': 0.1},
                 {'params': model.module.classifier.parameters(), 'lr': args.head_lr, 'weight_decay': 0.1},
+                {'params': model.module.token_classifier.parameters(), 'lr': args.head_lr, 'weight_decay': 0.1}, # 新增
                 {'params': getattr(model.module, 'confidence_module', nn.ModuleList()).parameters(), 'lr': args.head_lr},
             ])
             if rank == 0: logger.info("Phase 2: 解冻 Backbone")
@@ -332,37 +360,36 @@ def main():
             attention_mask = batch['attention_mask'].to(device)
             motif_mask = batch['motif_mask'].to(device)
             labels = batch['label'].to(device)
+            token_labels = batch['token_labels'].to(device) # [修复] 解包
 
-            # # --- 2. 使用 autocast 开启混合精度 ---
-            # # device_type 建议显式指定为 'cuda'
-            # with torch.cuda.amp.autocast(device_type='cuda'):
-            #     logits = model(input_ids, attention_mask, motif_mask)
-            #     loss = criterion(logits, labels)
-
-            # # --- 3. FP16 的反向传播与更新 ---
-            # # 必须使用 scaler 来缩放 loss，防止梯度下溢
-            # scaler.scale(loss).backward()
+            # [修复] 接收两个输出
+            global_logits, token_logits = model(input_ids, attention_mask, motif_mask)
             
-            # # --- 4. 重要：如果你想做梯度裁剪 (Clip Grad Norm) ---
-            # # 在 FP16 下，必须先 unscale 梯度，然后再裁剪
-            # scaler.unscale_(optimizer)
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # [修复] 计算两个 Loss
+            loss_cls = criterion_cls(global_logits, labels)
             
-            # # --- 5. 最后通过 scaler 更新参数 ---
-            # scaler.step(optimizer)
-            # scaler.update()
+            # (Batch, Len, 5) -> (Batch*Len, 5) vs (Batch*Len)
+            loss_seg = criterion_seg(token_logits.view(-1, 5), token_labels.view(-1))
+            
+            # 联合 Loss
+            loss = loss_cls + 0.5 * loss_seg
 
-            logits = model(input_ids, attention_mask, motif_mask)
-            loss = criterion(logits, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             total_loss += loss.item()
             
-            if rank == 0: pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            if rank == 0: pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'cls': f'{loss_cls.item():.3f}',
+                'seg': f'{loss_seg.item():.3f}'
+            })
 
-        val_loss, val_acc, val_f1, val_auc = evaluate(model, val_loader, criterion, device, rank, world_size)
+        # [修复] Evaluate 传参
+        val_loss, val_acc, val_f1, val_auc = evaluate(
+            model, val_loader, criterion_cls, criterion_seg, device, rank, world_size
+        )
 
         if rank == 0:
             avg_train_loss = total_loss / len(train_loader) if len(train_loader) > 0 else 0
@@ -370,17 +397,14 @@ def main():
             logger.info(f"Epoch {epoch} [{phase}] | Train Loss: {avg_train_loss:.4f} | "
                         f"Val F1: {val_f1:.4f} | AUC: {val_auc:.4f}")
 
-            # 每一轮都保存一个独立的 checkpoint
+            # 保存 Checkpoint
             epoch_save_path = Path(args.output_dir) / f"checkpoint_epoch_{epoch}.pt"
             torch.save({
                 'epoch': epoch,
                 'model_state': model.module.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'val_f1': val_f1,
-                'val_auc': val_auc,
-                'train_loss': avg_train_loss
+                'val_f1': val_f1
             }, epoch_save_path)
-            logger.info(f"  💾 Saved epoch checkpoint to {epoch_save_path}")
 
             if val_f1 > best_val_f1:
                 best_val_f1 = val_f1
