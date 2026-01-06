@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-model.py
-========
-Motif-Guided SINE分类器 - 适配offset_mapping对齐
+model.py (Fixed with Task Decoupling)
+=====================================
+Motif-Guided SINE分类器 - 适配多任务解耦
 
-关键改进:
-1. 修复了 num_token_labels 未定义的 Bug
-2. 移除了错误的reshape逻辑
-3. 直接使用对齐好的token级motif_mask
+修复核心：
+1. 引入 Adapter 层解耦全局分类和序列分割任务，防止分割任务的梯度噪音干扰分类任务。
+2. 优化了 Head 结构。
 """
 
 import torch
@@ -93,7 +92,7 @@ class MotifAwareAttention(nn.Module):
 
 class MotifGuidedSINEClassifier(nn.Module):
     """
-    端到端的SINE分类器 (含 Segmentation Head)
+    端到端的SINE分类器 (含 Task Decoupling & Segmentation Head)
     """
     
     def __init__(
@@ -101,7 +100,7 @@ class MotifGuidedSINEClassifier(nn.Module):
         backbone,
         hidden_dim: int = 256,
         num_classes: int = 2,
-        num_token_labels: int = 5,  # [修复] 必须添加这个参数，默认值为 5
+        num_token_labels: int = 5,  # 0=Bg, 1=TSD, 2=Body, 3=PolyA, 4=Pad/-100
         dropout: float = 0.1,
         freeze_backbone: bool = False
     ):
@@ -115,7 +114,7 @@ class MotifGuidedSINEClassifier(nn.Module):
             for param in self.backbone.parameters():
                 param.requires_grad = False
         
-        # Motif感知注意力
+        # Motif感知注意力 (共享特征提取)
         self.motif_attention = MotifAwareAttention(
             hidden_dim=self.backbone_dim,
             num_heads=8,
@@ -124,28 +123,40 @@ class MotifGuidedSINEClassifier(nn.Module):
         # 置信度模块
         self.confidence_module = MotifConfidenceModule(self.backbone_dim)
         
-        # 1. 全局分类头
-        self.classifier = nn.Sequential(
+        # --- [新增] 任务适配层 (Task Adapters) ---
+        # 关键修改：将两个任务的特征空间解耦，防止梯度冲突
+        
+        # 适配层 1: 用于全局分类
+        self.cls_adapter = nn.Sequential(
             nn.Linear(self.backbone_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Dropout(dropout),
-            
+            nn.Dropout(dropout)
+        )
+        
+        # 适配层 2: 用于序列分割 (边界预测)
+        self.seg_adapter = nn.Sequential(
+            nn.Linear(self.backbone_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        # --- 任务头 (Task Heads) ---
+        
+        # 1. 全局分类头 (接在 cls_adapter 后)
+        self.classifier = nn.Sequential(
+            # 输入已经是 hidden_dim
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            
             nn.Linear(hidden_dim // 2, num_classes)
         )
 
-        # 2. 序列标注头 (Segmentation Head)
-        # 这里使用了传入的 num_token_labels 参数
+        # 2. 序列标注头 (接在 seg_adapter 后)
         self.token_classifier = nn.Sequential(
-            nn.Linear(self.backbone_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
+            # 输入已经是 hidden_dim，直接映射到 token labels
             nn.Linear(hidden_dim, num_token_labels) 
         )
     
@@ -158,9 +169,6 @@ class MotifGuidedSINEClassifier(nn.Module):
         """
         前向传播返回两个 logits
         """
-        # 形状验证
-        batch_size, seq_len = input_ids.shape
-        
         # 1. Backbone编码
         outputs = self.backbone(
             input_ids=input_ids,
@@ -173,25 +181,31 @@ class MotifGuidedSINEClassifier(nn.Module):
         confidence_score = self.confidence_module(hidden_states, motif_mask)
         refined_motif_mask = motif_mask * confidence_score
         
-        # 2. Motif感知注意力
+        # 2. Motif感知注意力 (增强特征)
         enhanced_states = self.motif_attention(
             hidden_states, 
             refined_motif_mask, 
             attention_mask=attention_mask
         )
         
-        # --- 分支 1: 全局分类 ---
-        # 加权池化
+        # --- 分支 1: 全局分类 (走 cls_adapter) ---
+        # 先经过适配层，隔离特征
+        cls_features = self.cls_adapter(enhanced_states)
+        
+        # 加权池化 (使用 cls 特征)
         weights = motif_mask.unsqueeze(-1) * attention_mask.unsqueeze(-1)
-        weighted_sum = (enhanced_states * weights).sum(dim=1)
+        weighted_sum = (cls_features * weights).sum(dim=1)
         sum_weights = weights.sum(dim=1).clamp(min=1e-9)
         sequence_representation = weighted_sum / sum_weights
         
         global_logits = self.classifier(sequence_representation)
 
-        # --- 分支 2: 序列标注 ---
+        # --- 分支 2: 序列标注 (走 seg_adapter) ---
+        # 先经过适配层，隔离特征
+        seg_features = self.seg_adapter(enhanced_states)
+        
         # 对每个 token 进行分类
-        token_logits = self.token_classifier(enhanced_states) # (B, L, Num_Labels)
+        token_logits = self.token_classifier(seg_features) # (B, L, Num_Labels)
         
         return global_logits, token_logits
     
