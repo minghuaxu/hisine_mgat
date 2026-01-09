@@ -73,7 +73,8 @@ class MotifAwareAttention(nn.Module):
             query=hidden_states,
             key=hidden_states,
             value=hidden_states,
-            key_padding_mask=key_padding_mask 
+            key_padding_mask=key_padding_mask,
+            need_weights=False  # 添加这个参数，节省显存
         )
         attn_output = self.dropout(attn_output)
         
@@ -176,6 +177,7 @@ class MotifGuidedSINEClassifier(nn.Module):
             output_hidden_states=True
         )
         hidden_states = outputs.hidden_states[-1]
+       
 
         # Motif 置信度
         confidence_score = self.confidence_module(hidden_states, motif_mask)

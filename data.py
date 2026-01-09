@@ -85,99 +85,178 @@ class SINEDatasetE2E(Dataset):
         sequence = item['seq']
         label = item['label']
         
-        # 获取预先计算好的核心区坐标
+        # 1. 原始坐标
         core_start = item.get('core_start', -1)
         core_end = item.get('core_end', -1)
         is_positive = (label == 1)
-
-        # 1. 获取 Mask (Float)
-        if unique_id in self.masks_dict:
-            base_mask = self.masks_dict[unique_id]
-        else:
-            base_mask = np.full(len(sequence), 0.3, dtype=np.float32)
-
-        # 2. 生成 OBIE Labels (Int)
-        base_labels = self._create_token_labels(len(sequence), core_start, core_end, is_positive)
-
-        # 3. 长度截断
-        min_len = min(len(base_mask), len(sequence), len(base_labels))
-        base_mask = base_mask[:min_len]
-        base_labels = base_labels[:min_len]
-        sequence = sequence[:min_len]
-
-        # 4. 增强
-        if self.is_training:
-            noise = np.random.normal(0, 0.05, size=base_mask.shape)
-            base_mask = np.clip(base_mask + noise, 0.1, 3.0)
-            base_mask = gaussian_kernel_smooth(base_mask, sigma=2.0)
-
-        # 5. Tokenization
-        content_ids = self.tokenizer.encode(sequence, add_special_tokens=False)
-        max_content_tokens = self.max_token_length - 1
-        if len(content_ids) > max_content_tokens:
-            content_ids = content_ids[-max_content_tokens:]
-            
-        # 6. Alignment
-        mapping = []
-        pos = 0
-        for tid in content_ids:
-            tok_str = self.tokenizer.decode([tid])
-            tok_len = max(1, len(tok_str))
-            mapping.append((pos, pos + tok_len))
-            pos += tok_len
         
-        if pos < len(base_mask):
-            base_mask = base_mask[:pos]
-            base_labels = base_labels[:pos]
-        elif pos > len(base_mask):
-            pad_len = pos - len(base_mask)
-            base_mask = np.concatenate([base_mask, np.full(pad_len, 0.3, dtype=np.float32)])
-            base_labels = np.concatenate([base_labels, np.full(pad_len, -100, dtype=np.int64)])
+        # -------------------------------------------------------------------------
+        # [Step 1] 随机裁剪 (安全版)
+        # -------------------------------------------------------------------------
+        target_char_len = self.max_token_length - 5 
+        seq_len = len(sequence)
+        
+        start_idx = 0
+        end_idx = seq_len
 
-        # 7. Tensors
-        input_ids = torch.full((self.max_token_length,), self.pad_token_id, dtype=torch.long)
-        attention_mask = torch.zeros(self.max_token_length, dtype=torch.long)
-        token_mask = torch.zeros(self.max_token_length, dtype=torch.float32)
+        if self.is_training and seq_len > target_char_len:
+            if is_positive:
+                # 必须包含 SINE 的一部分
+                safe_min = max(0, core_end - target_char_len + 10)
+                safe_max = max(0, min(seq_len - target_char_len, core_start - 10))
+                
+                if safe_min < safe_max:
+                    start_idx = np.random.randint(safe_min, safe_max)
+                else:
+                    start_idx = np.random.randint(0, seq_len - target_char_len)
+            else:
+                start_idx = np.random.randint(0, seq_len - target_char_len)
+            
+            end_idx = start_idx + target_char_len
+
+        # 执行裁剪
+        sequence_cropped = sequence[start_idx:end_idx]
+        
+        # Mask 裁剪
+        base_mask_cropped = None
+        if unique_id in self.masks_dict:
+            full_mask = self.masks_dict[unique_id]
+            if len(full_mask) >= end_idx:
+                base_mask_cropped = full_mask[start_idx:end_idx]
+            else:
+                # 补齐长度不足的 mask
+                pad_len = seq_len - len(full_mask)
+                if pad_len > 0:
+                    full_mask = np.concatenate([full_mask, np.full(pad_len, 0.3, dtype=np.float32)])
+                base_mask_cropped = full_mask[start_idx:end_idx]
+        
+        if base_mask_cropped is None:
+            base_mask_cropped = np.full(len(sequence_cropped), 0.3, dtype=np.float32)
+
+        # 更新相对坐标
+        new_core_start = (core_start - start_idx) if is_positive else -1
+        new_core_end = (core_end - start_idx) if is_positive else -1
+
+        # 生成字符级标签
+        base_labels_cropped = self._create_token_labels(
+            len(sequence_cropped), new_core_start, new_core_end, is_positive
+        )
+
+        # -------------------------------------------------------------------------
+        # [Step 2] Tokenization (不请求 offsets_mapping)
+        # -------------------------------------------------------------------------
+        encoding = self.tokenizer(
+            sequence_cropped,
+            max_length=self.max_token_length,
+            padding="max_length",
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors="pt"
+        )
+        
+        input_ids = encoding["input_ids"][0]
+        attention_mask = encoding["attention_mask"][0]
+
+        # -------------------------------------------------------------------------
+        # [Step 3] 手动计算 Offsets (适配 NucleotidesKmersTokenizer)
+        # -------------------------------------------------------------------------
+        # 获取特殊 token 的 ID 集合 (用于跳过计算)
+        special_token_ids = {
+            self.tokenizer.bos_token_id, 
+            self.tokenizer.eos_token_id, 
+            self.tokenizer.cls_token_id, 
+            self.tokenizer.pad_token_id, 
+            self.tokenizer.mask_token_id,
+            self.tokenizer.unk_token_id
+        }
+        # 如果 tokenizer 还有其他 special tokens，也加入
+        if hasattr(self.tokenizer, 'all_special_ids'):
+            special_token_ids.update(self.tokenizer.all_special_ids)
+
+        # 将 tensor 转回 token 列表
+        tokens = self.tokenizer.convert_ids_to_tokens(input_ids)
+        
+        manual_offsets = []
+        current_pos = 0
+        
+        for i, token in enumerate(tokens):
+            # 1. 跳过 Padding (通过 attention_mask 判断最准)
+            if attention_mask[i] == 0:
+                manual_offsets.append((0, 0))
+                continue
+
+            # 2. 处理特殊 Token (CLS, BOS, EOS 等)
+            # 它们的字符长度不计入 sequence 进度
+            token_id = input_ids[i].item()
+            if token_id in special_token_ids:
+                manual_offsets.append((0, 0))
+                continue
+            
+            # 3. 处理普通 K-mer Token
+            # NucleotidesKmersTokenizer 的 token 就是原始序列的子串 (例如 "ATC", "G", "N")
+            # 不会有 WordPiece 的 "##" 或 BPE 的 "Ġ" 前缀，所以直接取 len 即可
+            token_len = len(token)
+            
+            # 记录区间 [start, end)
+            start = current_pos
+            end = current_pos + token_len
+            
+            # 简单的边界保护 (防止 token 长度溢出裁剪后的序列)
+            if end > len(sequence_cropped):
+                end = len(sequence_cropped)
+                
+            manual_offsets.append((start, end))
+            
+            # 推进光标
+            current_pos += token_len
+
+        # -------------------------------------------------------------------------
+        # [Step 4] 映射 Labels 和 Mask (使用手动计算的 offsets)
+        # -------------------------------------------------------------------------
+        motif_mask = torch.zeros(self.max_token_length, dtype=torch.float32)
         token_labels = torch.full((self.max_token_length,), -100, dtype=torch.long)
         
-        input_ids[0] = self.cls_token_id
-        attention_mask[0] = 1
-        token_mask[0] = float(base_mask.mean()) if len(base_mask) > 0 else 0.3
-        token_labels[0] = -100
+        actual_seq_len = len(sequence_cropped)
         
-        valid_len = len(content_ids)
-        input_ids[1 : 1+valid_len] = torch.tensor(content_ids, dtype=torch.long)
-        attention_mask[1 : 1+valid_len] = 1
-        
-        for i, (start, end) in enumerate(mapping):
-            token_idx = i + 1
-            seg_mask = base_mask[start:end]
-            token_mask[token_idx] = float(np.max(seg_mask)) if len(seg_mask) > 0 else 0.3
+        for idx, (s, e) in enumerate(manual_offsets):
+            # 忽略 (0,0) 的 Offset (特殊 token 或 padding)
+            if s == e:
+                # 对 CLS 做特殊处理：赋予平均 mask 值，但不给 label
+                if idx == 0 and len(base_mask_cropped) > 0:
+                    motif_mask[idx] = float(base_mask_cropped.mean())
+                continue
+                
+            if s >= actual_seq_len: continue
             
-            # Label Mapping Strategy for OBIE
-            seg_label = base_labels[start:end]
+            # 映射 Mask
+            seg_mask = base_mask_cropped[s:e]
+            motif_mask[idx] = float(np.max(seg_mask)) if len(seg_mask) > 0 else 0.3
+            
+            # 映射 Labels
+            seg_label = base_labels_cropped[s:e]
             if len(seg_label) > 0:
-                if np.any(seg_label == -100):
-                    token_labels[token_idx] = -100
-                else:
-                    # 优先级：B(1) > E(3) > I(2) > O(0)
-                    # 我们希望尽可能捕捉边界
-                    if 1 in seg_label: token_labels[token_idx] = 1
-                    elif 3 in seg_label: token_labels[token_idx] = 3
-                    elif 2 in seg_label: token_labels[token_idx] = 2
-                    else: token_labels[token_idx] = 0
+                if 1 in seg_label: token_labels[idx] = 1   # B
+                elif 3 in seg_label: token_labels[idx] = 3 # E
+                elif 2 in seg_label: token_labels[idx] = 2 # I
+                else: token_labels[idx] = 0                # O
             else:
-                token_labels[token_idx] = -100
+                token_labels[idx] = -100
 
-        if self.is_training and np.random.rand() < self.mask_dropratio:
-            is_padding = (input_ids == self.pad_token_id)
-            token_mask.fill_(0.3)
-            token_mask[is_padding] = 0.0
+        # -------------------------------------------------------------------------
+        # [Step 5] Mask 增强
+        # -------------------------------------------------------------------------
+        if self.is_training:
+            if np.random.rand() < self.mask_dropratio:
+                valid_pos = (attention_mask == 1)
+                motif_mask[valid_pos] = 0.3
+            else:
+                # 可选：加一点高斯噪声
+                pass
 
         return {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
-            'motif_mask': token_mask,
+            'motif_mask': motif_mask,
             'token_labels': token_labels,
             'unique_id': unique_id,
             'label': torch.tensor(label, dtype=torch.long)
