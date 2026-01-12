@@ -13,7 +13,7 @@ Motif-Guided SINE分类器 - 适配多任务解耦
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torchcrf import CRF
 
 class MotifConfidenceModule(nn.Module):
     """
@@ -82,7 +82,9 @@ class MotifAwareAttention(nn.Module):
         assert motif_mask.size(1) == hidden_states.size(1), \
             f"Motif mask长度({motif_mask.size(1)})与hidden states({hidden_states.size(1)})不匹配"
         
-        motif_weights = motif_mask.unsqueeze(-1)  # (batch, seq_len, 1)
+        # motif_weights = motif_mask.unsqueeze(-1)  # (batch, seq_len, 1)
+        # scaled_output = attn_output * motif_weights
+        motif_weights = motif_mask.unsqueeze(-1).clamp(min=0.5)  # 最低 0.5，保证基本注意力
         scaled_output = attn_output * motif_weights
         
         # 3. 残差连接 + LayerNorm
@@ -124,52 +126,37 @@ class MotifGuidedSINEClassifier(nn.Module):
         # 置信度模块
         self.confidence_module = MotifConfidenceModule(self.backbone_dim)
         
-        # --- [新增] 任务适配层 (Task Adapters) ---
-        # 关键修改：将两个任务的特征空间解耦，防止梯度冲突
-        
-        # 适配层 1: 用于全局分类
-        self.cls_adapter = nn.Sequential(
+        # --- [修正点 1] 朋友建议：共享投影层 ---
+        # 两个任务共用这个层。
+        # 好处：负样本进来时，分类 Loss 会更新这个层，防止它变成“只懂正样本的瞎子”。
+        self.shared_adapter = nn.Sequential(
             nn.Linear(self.backbone_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout)
         )
         
-        # 适配层 2: 用于序列分割 (边界预测)
-        self.seg_adapter = nn.Sequential(
-            nn.Linear(self.backbone_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
+        # --- [修正点 2] 任务头 ---
+        self.token_classifier = nn.Linear(hidden_dim, num_token_labels)
         
-        # --- 任务头 (Task Heads) ---
-        
-        # 1. 全局分类头 (接在 cls_adapter 后)
+        # 分类头：输入依然是 hidden_dim
         self.classifier = nn.Sequential(
-            # 输入已经是 hidden_dim
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
             nn.GELU(),
-            nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, num_classes)
         )
-
-        # 2. 序列标注头 (接在 seg_adapter 后)
-        self.token_classifier = nn.Sequential(
-            # 输入已经是 hidden_dim，直接映射到 token labels
-            nn.Linear(hidden_dim, num_token_labels) 
-        )
+        
+        # batch_first=True 表示输入维度是 (Batch, Seq_Len, Tags)
+        self.crf = CRF(num_token_labels, batch_first=True)
     
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        motif_mask: torch.Tensor
+        motif_mask: torch.Tensor,
+        token_labels: torch.Tensor = None,
+        labels: torch.Tensor = None
     ):
-        """
-        前向传播返回两个 logits
-        """
         # 1. Backbone编码
         outputs = self.backbone(
             input_ids=input_ids,
@@ -178,38 +165,85 @@ class MotifGuidedSINEClassifier(nn.Module):
         )
         hidden_states = outputs.hidden_states[-1]
        
-
         # Motif 置信度
         confidence_score = self.confidence_module(hidden_states, motif_mask)
-        refined_motif_mask = motif_mask * confidence_score
+        # refined_motif_mask = motif_mask * confidence_score
+        refined_motif_mask = motif_mask * (0.5 + 0.5 * confidence_score)
         
-        # 2. Motif感知注意力 (增强特征)
+        # 2. Motif感知注意力
         enhanced_states = self.motif_attention(
             hidden_states, 
             refined_motif_mask, 
             attention_mask=attention_mask
         )
         
-        # --- 分支 1: 全局分类 (走 cls_adapter) ---
-        # 先经过适配层，隔离特征
-        cls_features = self.cls_adapter(enhanced_states)
-        
-        # 加权池化 (使用 cls 特征)
-        weights = motif_mask.unsqueeze(-1) * attention_mask.unsqueeze(-1)
-        weighted_sum = (cls_features * weights).sum(dim=1)
-        sum_weights = weights.sum(dim=1).clamp(min=1e-9)
-        sequence_representation = weighted_sum / sum_weights
-        
-        global_logits = self.classifier(sequence_representation)
+        # 2. 共享特征提取
+        # 无论是分类还是分割，都基于这个 shared_features
+        shared_features = self.shared_adapter(enhanced_states)
 
-        # --- 分支 2: 序列标注 (走 seg_adapter) ---
-        # 先经过适配层，隔离特征
-        seg_features = self.seg_adapter(enhanced_states)
+        # 3. 序列标注输出 (Emissions)
+        emissions = self.token_classifier(shared_features)
+
+        # ---  硬核耦合 (Segmentation-Guided Pooling) ---
+        # 我们不再只用 motif_mask 做池化，而是利用模型自己预测的“前景概率”来做池化。
+        # 逻辑：如果模型认为这块是 Body/TSD/PolyA，那么这块特征对分类就更重要。
         
-        # 对每个 token 进行分类
-        token_logits = self.token_classifier(seg_features) # (B, L, Num_Labels)
+        with torch.no_grad():
+            # 计算前景概率 (Foreground Probability)
+            # 假设 index 0 是 Background (O)
+            probs = torch.softmax(emissions, dim=-1)
+            # p_foreground = 1 - p_background
+            foreground_prob = 1.0 - probs[:, :, 0] 
+            
+            # 结合原本的 attention_mask
+            pooling_weights = foreground_prob * attention_mask
+
+        # 加权平均池化 (Weighted Mean Pooling)
+        # 形状: (Batch, Seq, 1) * (Batch, Seq, Hidden) -> Sum -> (Batch, Hidden)
+        weighted_sum = (shared_features * pooling_weights.unsqueeze(-1)).sum(dim=1)
+        sum_weights = pooling_weights.sum(dim=1, keepdim=True).clamp(min=1e-9)
+        seg_guided_repr = weighted_sum / sum_weights
         
-        return global_logits, token_logits
+        # 为了稳健，我们还是加上全局平均池化 (Global Mean Pooling) 做残差
+        # 这样即使一开始分割预测很烂，分类也能靠全局特征撑住
+        global_mean_repr = (shared_features * attention_mask.unsqueeze(-1)).sum(dim=1) / attention_mask.sum(dim=1, keepdim=True).clamp(min=1e-9)
+        
+        final_cls_repr = seg_guided_repr + global_mean_repr
+        
+        global_logits = self.classifier(final_cls_repr)
+
+        # 4. CRF Loss 计算 (保留我的“切片逻辑”，这依然是必要的！)
+        # 虽然层共享了，但 CRF Loss 的数值如果太大还是会干扰。
+        # 且我们依然不需要对负样本计算复杂的 CRF 路径。
+        crf_loss = torch.tensor(0.0, device=input_ids.device)
+        
+        if token_labels is not None and labels is not None:
+            valid_mask = (attention_mask.bool() & (token_labels != -100))
+            pos_indices = (labels == 1).nonzero(as_tuple=True)[0]
+            
+            if len(pos_indices) > 0:
+                sub_emissions = emissions[pos_indices]
+                sub_labels = token_labels[pos_indices]
+                sub_mask = valid_mask[pos_indices]
+                
+                safe_sub_labels = sub_labels.clone().masked_fill(~sub_mask, 0)
+                
+                with torch.cuda.amp.autocast(enabled=False):
+                    log_likelihood = self.crf(sub_emissions.float(), safe_sub_labels, mask=sub_mask, reduction='sum')
+                    num_valid_tokens = sub_mask.sum().float().clamp(min=1.0)
+                    crf_loss = -log_likelihood / num_valid_tokens
+            
+        return global_logits, emissions, crf_loss
+
+    def decode(self, emissions, attention_mask):
+        """
+        [新增] 使用 Viterbi 算法解码最佳路径
+        返回: List[List[int]] (Batch 中每个样本的 Tag 序列)
+        """
+        # 同样，确保 decode 时的 mask 第一位也是 True
+        mask = attention_mask.bool()
+        mask[:, 0] = True 
+        return self.crf.decode(emissions, mask=mask)
     
     def predict_proba(self, input_ids, attention_mask, motif_mask):
         """仅用于推理全局概率"""
