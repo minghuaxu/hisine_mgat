@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-04_build_masks.py
+06_build_masks.py
 =================
 功能：离线预计算 Mask 矩阵
 输入：
@@ -60,7 +60,7 @@ def build_masks(csv_path, motif_tsv_path, out_path):
         unique_id = f"{chrom}:{start}-{end}({strand})"
         
         # 2. 重建拼接序列以获取正确的长度 (L)
-        # 必须复刻 03_detect_motifs.py 的逻辑
+        # 必须复刻 detect_motifs.py 的逻辑
         if strand == '-':
             core = revcomp(row['seq'])
             left = revcomp(row['flank_right']) # 负链交换左右

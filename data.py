@@ -216,17 +216,21 @@ class SINEDatasetE2E(Dataset):
         motif_mask = torch.zeros(self.max_token_length, dtype=torch.float32)
         token_labels = torch.full((self.max_token_length,), -100, dtype=torch.long)
         
+        # 将所有“有效 Token 位置”预设为 0
+        # 这样可以保证只要 attention_mask[i]==1，token_labels[i] 就不是 -100
+        # 同时也解决了 CLS (index 0) 的问题
+        valid_indices = (attention_mask == 1)
+        token_labels[valid_indices] = 0
+
         actual_seq_len = len(sequence_cropped)
         
         for idx, (s, e) in enumerate(manual_offsets):
             # 忽略 (0,0) 的 Offset (特殊 token 或 padding)
             if s == e:
-                # 对 CLS 做特殊处理：赋予平均 mask 值，但不给 label
-                if idx == 0 and len(base_mask_cropped) > 0:
-                    motif_mask[idx] = float(base_mask_cropped.mean())
                 continue
-                
-            if s >= actual_seq_len: continue
+
+            if s >= actual_seq_len: 
+                continue
             
             # 映射 Mask
             seg_mask = base_mask_cropped[s:e]
@@ -240,7 +244,7 @@ class SINEDatasetE2E(Dataset):
                 elif 2 in seg_label: token_labels[idx] = 2 # I
                 else: token_labels[idx] = 0                # O
             else:
-                token_labels[idx] = -100
+                token_labels[idx] = 0 # Outside
 
         # -------------------------------------------------------------------------
         # [Step 5] Mask 增强
@@ -252,6 +256,12 @@ class SINEDatasetE2E(Dataset):
             else:
                 # 可选：加一点高斯噪声
                 pass
+
+        if self.is_training and item['label'] == 1 and np.random.rand() < 0.3:  # 30% 正样本模拟退化
+            # 随机 drop 部分 motif 区域
+            motif_mask = motif_mask * torch.bernoulli(torch.full_like(motif_mask, 0.5)).float()
+            # 或直接降级
+            motif_mask = motif_mask.clamp(max=1.0)  # 模拟模糊 motif
 
         return {
             'input_ids': input_ids,

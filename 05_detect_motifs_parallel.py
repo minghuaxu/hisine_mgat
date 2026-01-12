@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-03_detect_motifs_parallel.py
+05_detect_motifs_parallel.py
 ============================
 功能：SINE Motif 并行检测脚本
-特点：
-1. 多进程并行加速 (Multiprocessing)
-2. 进度条显示 (tqdm)
-3. 保持与串行版完全一致的输出格式和坐标逻辑
 """
 
 import argparse
@@ -121,132 +117,168 @@ def is_low_complexity(seq):
     most_common = max(set(dimers), key=dimers.count)
     return dimers.count(most_common) > len(seq) * 0.75
 
+def calculate_complexity(seq):
+    """简单计算序列复杂度，避免匹配到 poly-N"""
+    if not seq: return 0
+    return len(set(seq)) / len(seq)
+
 def detect_structure(core, left, right):
     """
-    返回相对于 Left+Core+Right 拼接序列的坐标
+    修复版结构检测：
+    强制验证 Core 结尾与 Right TSD 之间的 'Gap' 必须是 PolyA/Tail。
+    防止 TSD 匹配到远处，导致将中间的非相关序列误判为 PolyA。
     """
     core = core.upper()
     left = left.upper()
     right = right.upper()
     
+    full_seq = left + core + right
+    
     L_len = len(left)
     C_len = len(core)
-    full_seq = left + core + right
-
-    # === 1. 独立检测 PolyA (Blind Search at 3' end) ===
-    # 逻辑：在 Core 的末尾 (或 Right 的开头) 寻找 PolyA
-    # 我们关注拼接点附近的 50bp 窗口
-    polyA_window_start = L_len + C_len - 50 
-    polyA_window_end = L_len + C_len + 20 # 允许溢出到 Right 一点点
     
-    # 提取待检测区域
-    check_region = full_seq[max(0, polyA_window_start) : min(len(full_seq), polyA_window_end)]
-    # print(check_region)
-    
-    best_polyA = None
-    
-    # 简单的滑动窗口找最密集的 A
-    if len(check_region) >= 10:
-        # 寻找最长连续 A 或高纯度 A 区
-        # 这里用正则或者简单统计
-        # 为了速度，我们找 "Window 10bp, A count >= 8"
-        max_score = 8
-        for i in range(len(check_region) - 10):
-            sub = check_region[i : i+15] # 看 15bp
-            # 使用正则找出 sub 中所有连续的 A 段
-            # re.finditer 会返回每个匹配对象的起点和终点
-            a_matches = list(re.finditer(r'A+', sub))
-            
-            if a_matches:
-                # 在这 15bp 里，找出最长的一段连续 A
-                longest_match = max(a_matches, key=lambda m: m.end() - m.start())
-                
-                # 这段连续 A 的长度
-                current_consecutive_len = longest_match.end() - longest_match.start()
-                
-                # 如果当前这一段比之前记录的都要长，则更新
-                if current_consecutive_len > max_score:
-                    max_score = current_consecutive_len
-                    
-                    # 计算精确坐标：
-                    # polyA_window_start: check_region 在整条序列中的起点偏移
-                    # i: sub 在 check_region 中的偏移
-                    # longest_match.start(): 连续 A 在 sub 中的起点偏移
-                    p_start = polyA_window_start + i + longest_match.start()
-                    p_end = polyA_window_start + i + longest_match.end()
-                    
-                    best_polyA = (p_start, p_end)
-    # print(full_seq[best_polyA[0]:best_polyA[1]])
-
-    search_overlap = 50
-    search_limit = 100
-    
-    search_start_global = L_len + max(0, C_len - search_overlap)
-    search_seq = core[max(0, C_len - search_overlap):] + right[:search_limit]
+    # === 参数设置 ===
+    min_tsd_len = 4
+    max_tsd_len = 25
+    search_limit = 60    # 稍微缩减搜索范围，100bp 对 SINE 尾部通常太远了，除非有超长 PolyA
+    overlap_search = 15  # 允许 Core 注释偏后，向 Core 内部回溯的距离
     
     candidates = []
+
+    # 预计算 Left TSD 候选 (Left Flank 的末端)
+    # 为了性能，只计算一次
+    left_tsds = {} # len -> seq
+    for t_len in range(min_tsd_len, max_tsd_len + 1):
+        cand = left[-t_len:]
+        if not is_low_complexity(cand):
+            left_tsds[t_len] = cand
+
+    # 构建右侧搜索空间：从 Core 末端回溯 15bp 开始，往右延伸
+    # 搜索串 = Core尾部片段 + Right Flank
+    search_seq_base = core[max(0, C_len - overlap_search):] + right[:search_limit]
     
-    for t_len in range(25, 5, -1):
-        if L_len < t_len: continue
+    # 这里的 offset 是 search_seq_base[0] 在全局坐标系(L+C+R)中的绝对位置
+    search_seq_global_offset = L_len + max(0, C_len - overlap_search)
+    
+    # 理论上的 Core 结束位置 (全局坐标)
+    annotated_core_end = L_len + C_len
+
+    # === 1. TSD 驱动搜索 ===
+    # 从长到短遍历
+    for t_len in range(max_tsd_len, min_tsd_len - 1, -1):
+        if t_len not in left_tsds: continue
+        left_tsd = left_tsds[t_len]
         
-        left_tsd_cand = left[-t_len:]
-        if is_low_complexity(left_tsd_cand): continue
+        # 允许错配数
+        max_mm = int(t_len * 0.20) #稍微收紧错配标准
         
-        max_mm = max(1, int(t_len * 0.15))
-        
-        for i in range(len(search_seq) - t_len + 1):
-            right_tsd_cand = search_seq[i : i+t_len]
-            mm = hamming(left_tsd_cand, right_tsd_cand)
+        # 在右侧滑动寻找
+        # 限制：Right TSD 不应该离 Core 结尾太远，除非中间全是 A
+        for i in range(len(search_seq_base) - t_len + 1):
+            right_tsd_cand = search_seq_base[i : i+t_len]
+            mm = hamming(left_tsd, right_tsd_cand)
             
             if mm <= max_mm:
-                r_start_global = search_start_global + i
+                # 计算 Right TSD 在全局的坐标
+                r_start_global = search_seq_global_offset + i
                 r_end_global = r_start_global + t_len
                 
-                check_len = 25
-                tail_start_global = max(L_len, r_start_global - check_len)
-                tail_end_global = r_start_global
-                tail_region = full_seq[tail_start_global : tail_end_global]
+                # === 关键修复：Gap 验证 ===
+                # Gap 是从 [理论 Core 结束] 到 [Right TSD 开始] 的区域
+                # 注意：r_start_global 可能小于 annotated_core_end (说明 TSD 在 Core 内部，这是允许的)
                 
-                if not tail_region: continue
+                # 定义潜在的 PolyA 区域：
+                # 起点：取 (annotated_core_end - 20) 和 (r_start_global - 50) 的较后者
+                # 意思是：我们重点看 Right TSD 紧挨着的那一段，且不能脱离 Core 太远
+                poly_check_start = max(L_len, min(annotated_core_end - 15, r_start_global - 30))
+                poly_check_end = r_start_global
                 
-                cnt_A = tail_region.count('A')
-                purity_A = cnt_A / len(tail_region)
+                # 提取这段序列 (可能跨越 Core 和 Right)
                 
-                max_run, cur = 0, 0
-                for c in tail_region:
-                    if c == 'A': cur += 1
-                    else: max_run = max(max_run, cur); cur = 0
-                max_run = max(max_run, cur)
+                gap_seq = full_seq[poly_check_start : poly_check_end]
                 
-                valid_tail = False
-                if max_run >= 8: valid_tail = True
-                elif max_run >= 5 and purity_A >= 0.6: valid_tail = True
-                elif purity_A >= 0.8 and len(tail_region) >= 8: valid_tail = True
+                # 1. 距离惩罚：计算 TSD 距离“理论 Core 结尾”有多远
+                # 如果 r_start_global 远大于 annotated_core_end，说明 TSD 漂移到了右侧深处
+                dist_from_core = r_start_global - annotated_core_end
                 
-                if valid_tail:
-                    score = t_len * 10 - mm * 5 + max_run * 2
-                    candidates.append({
-                        'score': score,
-                        'polyA': (tail_start_global, tail_end_global),
-                        'tsd': (L_len - t_len, L_len, r_start_global, r_end_global)
-                    })
+                valid_gap = True
+                is_poly_a = False
+                
+                if len(gap_seq) == 0:
+                    a_content = 0
+                else:
+                    a_content = gap_seq.count('A') / len(gap_seq)
+                    t_content = gap_seq.count('T') / len(gap_seq)
+                    
+                    # === 强逻辑校验 ===
+                    # 如果 TSD 在 Core 结尾之后很远 (>10bp)，由于中间必须是 PolyA
+                    # 所以如果 A content 不够高，这绝对是个错误的匹配
+                    if dist_from_core > 10:
+                        if max(a_content, t_content) < 0.6: # 要求至少 60% 是 A/T
+                            valid_gap = False
+                    
+                    if max(a_content, t_content) > 0.4:
+                        is_poly_a = True
 
-    if candidates:
-        candidates.sort(key=lambda x: x['score'], reverse=True)
-        return candidates[0]['polyA'], candidates[0]['tsd']
+                if not valid_gap:
+                    continue # 跳过这个错误的 TSD 候选
 
-    # === 3. 最终决策 ===
-    # 如果没找到 TSD，但我们在第一步找到了强 PolyA（且位置合理，在 Core 末尾）
-    # 我们依然返回 PolyA，但 TSD 设为 None
-    if best_polyA is not None:
-        # 检查位置是否在 Core 的 3' 端附近
-        # PolyA 的 start 应该在 L_len + C_len 附近
-        p_start, p_end = best_polyA
-        # 如果 PolyA 确实是在 SINE 的尾巴上 (允许 30bp 误差)
-        if abs(p_start - (L_len + C_len)) < 50 or p_start < L_len + C_len:
-             return best_polyA, None
+                # === 打分 ===
+                # 基础分：长度 - 错配
+                score = (t_len * 2) - (mm * 4)
+                
+                # PolyA 加分
+                if is_poly_a:
+                    score += 6
+                
+                # 距离惩罚：离 Core 越远扣分越多 (防止匹配到无限远)
+                if dist_from_core > 0:
+                    score -= (dist_from_core * 0.1) 
+                
+                # 完美匹配奖励
+                if mm == 0: score += 3
+                
+                candidates.append({
+                    'score': score,
+                    'tsd': (L_len - t_len, L_len, r_start_global, r_end_global),
+                    'polyA_range': (poly_check_start, poly_check_end),
+                    'debug_dist': dist_from_core
+                })
+
+    # === 2. 选择最佳结果 ===
+    best_tsd = None
+    best_polyA = None
     
-    return None, None
+    if candidates:
+        # 按分数排序
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+        best_cand = candidates[0]
+        
+        # 阈值判定
+        if best_cand['score'] >= 8: 
+            best_tsd = best_cand['tsd']
+            # 细化 PolyA：简单返回 Gap 区域即可
+            best_polyA = best_cand['polyA_range']
+
+    # === 3. 兜底策略 (无 TSD 但有强 PolyA) ===
+    if best_tsd is None:
+        # 仅在 Core 结尾附近寻找
+        check_region_start = max(0, annotated_core_end - 20)
+        check_region_end = min(len(full_seq), annotated_core_end + 30)
+        region = full_seq[check_region_start : check_region_end]
+        
+        # 必须是连续的 A，或者高密度的 A
+        if "AAAAA" in region or region.count('A') >= 8:
+             # 这种情况下，我们不知道 TSD 在哪，但确认有 PolyA
+             # 可以返回 PolyA 坐标，TSD 留空
+             # 这里的坐标需要转换回 global
+             match = re.search(r'A{5,}', region)
+             if match:
+                 s = check_region_start + match.start()
+                 e = check_region_start + match.end()
+                 best_polyA = (s, e)
+            
+    return best_polyA, best_tsd
 
 # ====================== Worker & Init ======================
 
