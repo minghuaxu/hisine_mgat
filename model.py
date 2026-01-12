@@ -1,13 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-model.py (Fixed with Task Decoupling)
-=====================================
-Motif-Guided SINE分类器 - 适配多任务解耦
+model.py (Fixed with Task Decoupling & Gated Fusion)
+====================================================
+本模块实现了 Motif-Guided SINE Classifier 的核心架构。
 
-修复核心：
-1. 引入 Adapter 层解耦全局分类和序列分割任务，防止分割任务的梯度噪音干扰分类任务。
-2. 优化了 Head 结构。
+核心技术亮点 (Key Technologies):
+1. Task Decoupling (任务解耦): 
+   - 使用 Shared Adapter 分离特征空间，防止分类与分割任务直接冲突。
+   - 实现了"辅助任务(分割)倒逼主任务(分类)"的梯度回传机制。
+
+2. Motif-Aware Attention (Motif 感知注意力): 
+   - 结合先验的 Motif Mask (A-box/B-box) 增强关键区域的特征提取。
+
+3. Gated Fusion (门控融合): 
+   - 引入可学习的 Gate Layer，动态融合"全局保底特征"与"结构引导特征"。
+   - 机制：当分割边界清晰时 (SINE特征明显)，权重偏向结构特征；当边界模糊时 (模拟数据/背景)，自动回退到全局特征，保证分类鲁棒性。
+
+4. CRF (条件随机场): 
+   - 用于精确的序列边界解码 (TSD/Body/PolyA)，保证生物学结构的完整性。
+
+5. Selective CRF Loss (选择性 CRF 损失): 
+   - 仅在正样本 (SINE) 上计算 CRF Loss，避免负样本的无意义边界干扰分割头学习。
 """
 
 import torch
@@ -17,7 +31,8 @@ from torchcrf import CRF
 
 class MotifConfidenceModule(nn.Module):
     """
-    裁判员模块：判断这个 Motif 到底是不是真的
+    [模块 1] Motif置信度
+    功能：判断输入的 Motif Mask 是否包含有效信号。
     """
     def __init__(self, hidden_dim):
         super().__init__()
@@ -35,18 +50,17 @@ class MotifConfidenceModule(nn.Module):
         mask_sum = mask_expanded.sum(dim=1).clamp(min=1e-9)
         motif_region_embedding = motif_region_features / mask_sum
         
-        # 2. 裁判打分
+        # 2. 生成置信度分数
         confidence = self.net(motif_region_embedding)
         return confidence
 
 class MotifAwareAttention(nn.Module):
     """
-    Motif感知的注意力层
+    [模块 2] Motif 感知注意力层
+    功能：在 Self-Attention 中融入 Motif 的位置信息。
     """
     def __init__(self, hidden_dim: int, num_heads: int = 8, dropout: float = 0.1):
         super().__init__()
-        self.num_heads = num_heads
-        self.hidden_dim = hidden_dim
         
         self.attention = nn.MultiheadAttention(
             embed_dim=hidden_dim,
@@ -54,21 +68,15 @@ class MotifAwareAttention(nn.Module):
             dropout=dropout,
             batch_first=True
         )
-        
         self.layer_norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
     
-    def forward(
-        self, 
-        hidden_states: torch.Tensor, 
-        motif_mask: torch.Tensor,
-        attention_mask: torch.Tensor = None
-    ) -> torch.Tensor:
+    def forward(self,  hidden_states, motif_mask, attention_mask):
         key_padding_mask = None
         if attention_mask is not None:
             key_padding_mask = (attention_mask == 0)
 
-        # 1. 自注意力
+        # 1. 标准自注意力
         attn_output, _ = self.attention(
             query=hidden_states,
             key=hidden_states,
@@ -78,13 +86,9 @@ class MotifAwareAttention(nn.Module):
         )
         attn_output = self.dropout(attn_output)
         
-        # 2. Motif加权
-        assert motif_mask.size(1) == hidden_states.size(1), \
-            f"Motif mask长度({motif_mask.size(1)})与hidden states({hidden_states.size(1)})不匹配"
-        
-        # motif_weights = motif_mask.unsqueeze(-1)  # (batch, seq_len, 1)
-        # scaled_output = attn_output * motif_weights
-        motif_weights = motif_mask.unsqueeze(-1).clamp(min=0.5)  # 最低 0.5，保证基本注意力
+        # 2. Motif 加权 (Hard Attention Guidance)
+        # clamp(min=0.5) 保证非 Motif 区域也能保留至少 50% 的原始注意力流
+        motif_weights = motif_mask.unsqueeze(-1).clamp(min=0.5)
         scaled_output = attn_output * motif_weights
         
         # 3. 残差连接 + LayerNorm
@@ -95,7 +99,8 @@ class MotifAwareAttention(nn.Module):
 
 class MotifGuidedSINEClassifier(nn.Module):
     """
-    端到端的SINE分类器 (含 Task Decoupling & Segmentation Head)
+    [主模型] 端到端 SINE 分类器
+    集成了：Task Decoupling, Gated Fusion, CRF
     """
     
     def __init__(
@@ -117,18 +122,22 @@ class MotifGuidedSINEClassifier(nn.Module):
             for param in self.backbone.parameters():
                 param.requires_grad = False
         
-        # Motif感知注意力 (共享特征提取)
+        # 1. 特征增强模块
         self.motif_attention = MotifAwareAttention(
-            hidden_dim=self.backbone_dim,
-            num_heads=8,
-            dropout=dropout
+            hidden_dim=self.backbone_dim, num_heads=8, dropout=dropout
         )
         # 置信度模块
         self.confidence_module = MotifConfidenceModule(self.backbone_dim)
+
+        # 2. 门控融合层 (Gated Fusion)
+        # 输入维度是 hidden_dim * 2 (Global + Structural)，输出 1 个 alpha 值
+        self.gate_layer = nn.Sequential(
+            nn.Linear(hidden_dim * 2, 1), 
+            nn.Sigmoid()
+        )
         
-        # --- [修正点 1] 朋友建议：共享投影层 ---
-        # 两个任务共用这个层。
-        # 好处：负样本进来时，分类 Loss 会更新这个层，防止它变成“只懂正样本的瞎子”。
+        # 3. 共享适配层 (Shared Adapter)
+        # 分类与分割任务共用此层，实现特征空间的初步解耦
         self.shared_adapter = nn.Sequential(
             nn.Linear(self.backbone_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -136,18 +145,19 @@ class MotifGuidedSINEClassifier(nn.Module):
             nn.Dropout(dropout)
         )
         
-        # --- [修正点 2] 任务头 ---
+        # 4. 任务头 (Task Heads)
+        # 序列分割头
         self.token_classifier = nn.Linear(hidden_dim, num_token_labels)
         
-        # 分类头：输入依然是 hidden_dim
+        # 全局分类头
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
             nn.Linear(hidden_dim // 2, num_classes)
         )
-        
-        # batch_first=True 表示输入维度是 (Batch, Seq_Len, Tags)
-        self.crf = CRF(num_token_labels, batch_first=True)
+
+        # 5. CRF 层
+        self.crf = CRF(num_token_labels, batch_first=True) # batch_first=True 表示输入维度是 (Batch, Seq_Len, Tags)
     
     def forward(
         self,
@@ -157,7 +167,9 @@ class MotifGuidedSINEClassifier(nn.Module):
         token_labels: torch.Tensor = None,
         labels: torch.Tensor = None
     ):
-        # 1. Backbone编码
+        # ---------------------------------------------------
+        # Step 1: 基础特征提取 (Backbone + Motif Attention)
+        # ---------------------------------------------------
         outputs = self.backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -165,60 +177,73 @@ class MotifGuidedSINEClassifier(nn.Module):
         )
         hidden_states = outputs.hidden_states[-1]
        
-        # Motif 置信度
+        # 动态调整 Motif Mask
         confidence_score = self.confidence_module(hidden_states, motif_mask)
-        # refined_motif_mask = motif_mask * confidence_score
         refined_motif_mask = motif_mask * (0.5 + 0.5 * confidence_score)
         
-        # 2. Motif感知注意力
+        # Motif感知注意力
         enhanced_states = self.motif_attention(
             hidden_states, 
             refined_motif_mask, 
             attention_mask=attention_mask
         )
         
-        # 2. 共享特征提取
-        # 无论是分类还是分割，都基于这个 shared_features
+        # 经过共享适配层
         shared_features = self.shared_adapter(enhanced_states)
 
         # 3. 序列标注输出 (Emissions)
         emissions = self.token_classifier(shared_features)
 
-        # ---  硬核耦合 (Segmentation-Guided Pooling) ---
-        # 我们不再只用 motif_mask 做池化，而是利用模型自己预测的“前景概率”来做池化。
-        # 逻辑：如果模型认为这块是 Body/TSD/PolyA，那么这块特征对分类就更重要。
+        # ---------------------------------------------------
+        # Step 2: 双路特征聚合 (Dual-Path Aggregation)
+        # ---------------------------------------------------
+
+        # Path A: 全局通路 (Global Path) - "保底视力"
+        # 传统的 Mean Pooling，保证在边界不清晰时模型依然能工作
+        input_mask_expanded = attention_mask.unsqueeze(-1).float()
+        global_repr = (shared_features * input_mask_expanded).sum(dim=1) / input_mask_expanded.sum(dim=1).clamp(min=1e-9)
         
+        # Path B: 结构通路 (Structural Path) - "精准视力"
+        # 利用分割头的预测结果 (Foreground Probability) 来加权特征
+        emissions = self.token_classifier(shared_features)  # (Batch, Seq, NumLabels)
+
         with torch.no_grad():
             # 计算前景概率 (Foreground Probability)
-            # 假设 index 0 是 Background (O)
+            # 假设 index 0 是 Background (O), 我们取 1 - P(Bg)
             probs = torch.softmax(emissions, dim=-1)
-            # p_foreground = 1 - p_background
-            foreground_prob = 1.0 - probs[:, :, 0] 
+            foreground_prob = 1.0 - probs[:, :, 0]  # 0 is Background
             
-            # 结合原本的 attention_mask
-            pooling_weights = foreground_prob * attention_mask
+        # 注意: 这里没有 detach()，允许分类 Loss 对分割头进行梯度反馈 (Auxiliary Learning)
+        pooling_weights = foreground_prob * attention_mask
 
-        # 加权平均池化 (Weighted Mean Pooling)
-        # 形状: (Batch, Seq, 1) * (Batch, Seq, Hidden) -> Sum -> (Batch, Hidden)
-        weighted_sum = (shared_features * pooling_weights.unsqueeze(-1)).sum(dim=1)
+        # 结构化加权池化
+        structural_repr = (shared_features * pooling_weights.unsqueeze(-1)).sum(dim=1)
         sum_weights = pooling_weights.sum(dim=1, keepdim=True).clamp(min=1e-9)
-        seg_guided_repr = weighted_sum / sum_weights
-        
-        # 为了稳健，我们还是加上全局平均池化 (Global Mean Pooling) 做残差
-        # 这样即使一开始分割预测很烂，分类也能靠全局特征撑住
-        global_mean_repr = (shared_features * attention_mask.unsqueeze(-1)).sum(dim=1) / attention_mask.sum(dim=1, keepdim=True).clamp(min=1e-9)
-        
-        final_cls_repr = seg_guided_repr + global_mean_repr
-        
+        structural_repr = structural_repr / sum_weights
+
+        # ---------------------------------------------------
+        # Step 3: 门控融合 (Gated Fusion)
+        # ---------------------------------------------------
+        # alpha 决定了模型多大程度上依赖"结构特征"
+        # alpha 越接近 1，表示边界越清晰，模型越自信
+        gate_input = torch.cat([global_repr, structural_repr], dim=-1)
+        alpha = self.gate_layer(gate_input)
+
+        # 动态融合 [CRITICAL STEP]
+        final_cls_repr = alpha * structural_repr + (1 - alpha) * global_repr
+
+        # ---------------------------------------------------
+        # Step 4: 输出与 Loss 计算
+        # ---------------------------------------------------
         global_logits = self.classifier(final_cls_repr)
 
-        # 4. CRF Loss 计算 (保留我的“切片逻辑”，这依然是必要的！)
-        # 虽然层共享了，但 CRF Loss 的数值如果太大还是会干扰。
-        # 且我们依然不需要对负样本计算复杂的 CRF 路径。
+        # 计算 CRF Loss (仅在正样本上)
         crf_loss = torch.tensor(0.0, device=input_ids.device)
         
         if token_labels is not None and labels is not None:
+            # 筛选有效区域
             valid_mask = (attention_mask.bool() & (token_labels != -100))
+            # 筛选正样本 (SINE)
             pos_indices = (labels == 1).nonzero(as_tuple=True)[0]
             
             if len(pos_indices) > 0:
@@ -226,8 +251,10 @@ class MotifGuidedSINEClassifier(nn.Module):
                 sub_labels = token_labels[pos_indices]
                 sub_mask = valid_mask[pos_indices]
                 
+                # 安全处理：Mask 掉的地方 label 设为 0 (虽不参与计算但 CRF 需要合法输入)
                 safe_sub_labels = sub_labels.clone().masked_fill(~sub_mask, 0)
                 
+                # 关闭混合精度以保证 CRF 数值稳定
                 with torch.cuda.amp.autocast(enabled=False):
                     log_likelihood = self.crf(sub_emissions.float(), safe_sub_labels, mask=sub_mask, reduction='sum')
                     num_valid_tokens = sub_mask.sum().float().clamp(min=1.0)
@@ -240,14 +267,15 @@ class MotifGuidedSINEClassifier(nn.Module):
         [新增] 使用 Viterbi 算法解码最佳路径
         返回: List[List[int]] (Batch 中每个样本的 Tag 序列)
         """
-        # 同样，确保 decode 时的 mask 第一位也是 True
         mask = attention_mask.bool()
+        # 强制 mask 第一位为 True (防止全 0 mask 导致 crash)
         mask[:, 0] = True 
         return self.crf.decode(emissions, mask=mask)
     
     def predict_proba(self, input_ids, attention_mask, motif_mask):
         """仅用于推理全局概率"""
-        global_logits, _ = self.forward(input_ids, attention_mask, motif_mask)
+        # 注意：预测时不传 labels
+        global_logits, _, _ = self.forward(input_ids, attention_mask, motif_mask)
         return torch.softmax(global_logits, dim=1)
     
     def get_attention_weights(self, input_ids, attention_mask, motif_mask):
@@ -262,6 +290,9 @@ class MotifGuidedSINEClassifier(nn.Module):
 
 
 class FocalLoss(nn.Module):
+    """
+    处理类别不平衡的损失函数
+    """
     def __init__(self, alpha: float = 0.25, gamma: float = 2.0, reduction: str = 'mean'):
         super().__init__()
         self.alpha = alpha
