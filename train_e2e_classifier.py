@@ -1,3 +1,31 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+train_e2e_classifier.py
+=======================
+Motif-Guided SINE Classifier 的端到端训练脚本。
+
+核心技术特性 (Key Technologies):
+1. LoRA (Low-Rank Adaptation): 
+   - 仅微调 Backbone 的少量参数 (Rank=8)，大幅降低显存占用，同时保留预训练模型的泛化能力。
+   
+2. Auxiliary Task Strategy (辅助任务策略):
+   - 主任务：序列分类 (Binary Classification)。
+   - 辅助任务：序列分割 (CRF Segmentation)。
+   - 策略：CRF Loss 仅作为辅助正则项 (Weight=0.1)，用于引导模型关注正确的生物学边界，但不主导梯度方向。
+
+3. Dynamic Loss Weighting (动态损失权重):
+   - CRF Loss 引入 Warmup 机制，在训练初期权重为 0，防止初始阶段不准确的边界预测干扰分类头收敛。
+
+4. Focal Loss:
+   - 解决正负样本不平衡问题 (Pos:Neg ≈ 1:10+)，专注于难分样本的挖掘。
+"""
+
+import argparse
+import logging
+import os
+import sys
+import random
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -446,6 +474,47 @@ def main():
     TARGET_CRF_WEIGHT = 0.05
     CRF_WARMUP_EPOCHS = 3  # 前5个epoch逐渐增加权重
 
+    # =======================================================
+    # 打印训练参数 & 初始化日志工具 (WandB)
+    # =======================================================
+    if rank == 0: 
+        logger.info("="*60)
+        logger.info("🚀 TRAINING CONFIGURATION SUMMARY")
+        logger.info("="*60)
+        logger.info(f"  > Backbone      : {args.backbone_path}")
+        logger.info(f"  > LoRA Config   : r={args.lora_r}, alpha={args.lora_alpha}")
+        logger.info(f"  > Batch Size    : {args.batch_size} (Per GPU)")
+        logger.info(f"  > Learning Rate : Head={args.head_lr}, CRF=1e-3")
+        logger.info("-" * 60)
+        logger.info(f"  > [Dynamic Weight Strategy]")
+        logger.info(f"  > Target CRF Weight : {TARGET_CRF_WEIGHT}")
+        logger.info(f"  > Warmup Epochs     : {CRF_WARMUP_EPOCHS}")
+        logger.info("="*60)
+
+        # 初始化 WandB (主流可视化方案)
+        try:
+            import wandb
+            os.environ["WANDB_MODE"] = "offline"
+            # 你可以在这里修改 project 名
+            wandb.init(
+                project="SINE-Classifier-E2E", 
+                name=f"LoRA-r{args.lora_r}-wCRF{TARGET_CRF_WEIGHT}",
+                config=vars(args)
+            )
+            # 补充记录硬编码的参数
+            wandb.config.update({
+                "target_crf_weight": TARGET_CRF_WEIGHT,
+                "crf_warmup_epochs": CRF_WARMUP_EPOCHS
+            })
+            logger.info("✅ WandB initialized successfully.")
+        except ImportError:
+            logger.warning("⚠️ WandB not installed. Please run 'pip install wandb' for best visualization.")
+            wandb = None
+
+    # 定义全局步数，用于画连续的曲线
+    global_step = 0
+
+
     # --- Training Loop ---
     for epoch in range(start_epoch, args.epochs + 1):
         # 计算 CRF 权重
@@ -485,18 +554,44 @@ def main():
             optimizer.step()
             total_loss += loss.item()
 
+            # 更新全局步数
+            global_step += 1
+
             if rank==0: 
                 # 使用科学计数法，并处理 value 极小的情况
                 # 记录一下当前的 crf loss 值，如果是 0 说明是负样本 batch
                 crf_val = l_crf.item()
                 cls_val = l_cls.item()
-                
+                loss_val = loss.item()
+
                 # 只有当 crf_val > 0 时才认为是有意义的 CRF 训练
                 pbar.set_postfix({
-                    'ls': f"{loss.item():.2e}", 
+                    'ls': f"{loss_val:.2e}", 
                     'cls': f"{cls_val:.2e}",
                     'crf': f"{crf_val:.2e}"
                 })
+
+                # 每 100 个 Batch 打印一次详细 Log 到控制台
+                # 这样 log 文件里会有记录，方便事后 grep
+                if global_step % 100 == 0:
+                    logger.info(
+                        f"[Step {global_step}] "
+                        f"Loss: {loss_val:.4f} | "
+                        f"CLS: {cls_val:.4f} | "
+                        f"CRF: {crf_val:.4f} | "
+                        f"CRF_W: {current_crf_weight:.4f}"
+                    )
+
+                # 实时上报 WandB (记录每一个 step，画出来最平滑)
+                if wandb:
+                    wandb.log({
+                        "train/total_loss": loss_val,
+                        "train/cls_loss": cls_val,
+                        "train/crf_loss": crf_val,
+                        "train/crf_weight_step": current_crf_weight,
+                        "train/lr": optimizer.param_groups[0]['lr'],
+                        "epoch": epoch
+                    }, step=global_step)
         
         # --- Validation ---
         v_loss, v_acc, v_f1, v_auc, v_iou = evaluate(
@@ -505,6 +600,16 @@ def main():
 
         if rank == 0:
             logger.info(f"Epoch {epoch} | Val F1: {v_f1:.4f} | mIoU: {v_iou:.4f}")
+
+            # WandB 记录验证集指标
+            if wandb:
+                wandb.log({
+                    "val/f1": v_f1,
+                    "val/iou": v_iou,
+                    "val/acc": v_acc,
+                    "val/loss": v_loss
+                }, step=global_step)
+
             # 保存 Checkpoint
             state = {
                 'epoch': epoch,
@@ -527,6 +632,9 @@ def main():
 
             # Latest (用于断点续训)
             torch.save(state, Path(args.output_dir) / "latest.pt")
+    
+    if rank == 0 and wandb:
+        wandb.finish() # 结束 logging
 
     cleanup_ddp()
 
