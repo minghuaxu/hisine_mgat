@@ -10,7 +10,7 @@
 4. 过滤无效序列 (含 N 过多, 长度过短等)。
 5. 按 8:1:1 随机切分为 Train/Val/Test 集合。
 """
-
+import hashlib
 import argparse
 import pandas as pd
 import glob
@@ -59,6 +59,26 @@ def load_and_label(pattern, label, source_type, base_dir):
     
     return pd.concat(dfs, ignore_index=True)
 
+def get_split_group(chrom_name):
+    """
+    根据染色体名称的哈希值决定它属于哪个集合。
+    返回: 'train', 'val', 或 'test'
+    """
+    # 使用 md5 哈希保证跨平台和跨运行的一致性
+    chrom_str = str(chrom_name).strip()
+    hash_val = int(hashlib.md5(chrom_str.encode('utf-8')).hexdigest(), 16)
+    
+    # 取模 100，生成 0-99 的整数
+    mod_val = hash_val % 100
+    
+    # 8:1:1 划分
+    if mod_val < 80:
+        return 'train'
+    elif mod_val < 90:
+        return 'val'
+    else:
+        return 'test'
+    
 def filter_sequences(df, min_len=50, max_n_ratio=0.1):
     """清洗序列"""
     total = len(df)
@@ -123,9 +143,32 @@ def main():
     df_all = filter_sequences(df_all)
     
     # 4. 切分数据集 (Train/Val/Test = 8:1:1)
+
+    # 4. 按染色体切分数据集 (Chromosome-based Split)
+    print("\n[Split] 正在执行按染色体划分 (防止同源序列泄露)...")
+
+    # 应用哈希函数分配组别
+    df_all['split_group'] = df_all['chrom'].apply(get_split_group)
+
+    train_df = df_all[df_all['split_group'] == 'train'].copy()
+    val_df   = df_all[df_all['split_group'] == 'val'].copy()
+    test_df  = df_all[df_all['split_group'] == 'test'].copy()
+
+    # 移除辅助列
+    for d in [train_df, val_df, test_df]:
+        d.drop(columns=['split_group'], inplace=True)
+    
+    # 打印统计信息，检查是否某个物种的数据量在某个集合中过少
+    print(f"Train set size: {len(train_df)}")
+    print(f"Val set size:   {len(val_df)}")
+    print(f"Test set size:  {len(test_df)}")
+
+    # 可选：检查各集合的物种覆盖情况（防止某个物种的所有染色体都运气不好掉进了测试集）
+    print(train_df['source_type'].value_counts())
+
     # stratify=df_all['label'] 保证验证集里正负比例和训练集一致
-    train_df, temp_df = train_test_split(df_all, test_size=0.2, random_state=42, shuffle=True, stratify=df_all['source_type'])
-    val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42, shuffle=True, stratify=temp_df['source_type'])
+    # train_df, temp_df = train_test_split(df_all, test_size=0.2, random_state=42, shuffle=True, stratify=df_all['source_type'])
+    # val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42, shuffle=True, stratify=temp_df['source_type'])
     
     # 5. 保存
     train_path = os.path.join(args.out_dir, "train.csv")

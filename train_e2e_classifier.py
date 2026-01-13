@@ -40,6 +40,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from transformers import AutoTokenizer, AutoModelForMaskedLM, logging as tf_logging
+from transformers import get_linear_schedule_with_warmup
 from peft import get_peft_model, LoraConfig, TaskType
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
 from Bio.Seq import Seq
@@ -401,6 +402,15 @@ def main():
     train_ds = SINEDatasetE2E(train_samples, args.train_mask, tokenizer, args.max_length, True)
     val_ds = SINEDatasetE2E(val_samples, args.val_mask, tokenizer, args.max_length, False)
 
+    train_sampler = DistributedSampler(train_ds, shuffle=True)
+    val_sampler = DistributedSampler(val_ds, shuffle=False)
+    
+    # 保证 DataLoader 的随机性在多卡间一致
+    g = torch.Generator()
+    g.manual_seed(0)
+    train_dl = DataLoader(train_ds, args.batch_size, sampler=train_sampler, num_workers=4, collate_fn=collate_fn, worker_init_fn=seed_worker, generator=g)
+    val_dl = DataLoader(val_ds, args.batch_size, sampler=val_sampler, num_workers=4, collate_fn=collate_fn, worker_init_fn=seed_worker, generator=g)
+    
     # 2. 模型构建与 LoRA 应用
     backbone = AutoModelForMaskedLM.from_pretrained(args.backbone_path, trust_remote_code=True)
 
@@ -435,23 +445,26 @@ def main():
     base_params = filter(lambda p: id(p) not in crf_params and p.requires_grad, model.parameters()) 
 
     optimizer = torch.optim.AdamW([
-        {'params': base_params, 'lr': args.head_lr},          # LoRA + Head
-        {'params': model.module.crf.parameters(), 'lr': 1e-3} # CRF (需要较大 LR)
+        {'params': base_params, 'lr': args.head_lr, 'weight_decay': 0.05},          # LoRA + Head
+        {'params': model.module.crf.parameters(), 'lr': 1e-3, 'weight_decay': 0.0} # CRF (需要较大 LR)
     ])
+
+    #  添加 Scheduler (Cosine Decay 是目前最常用的)
+    # 计算总步数
+    num_training_steps = len(train_dl) * args.epochs
+    num_warmup_steps = int(0.1 * num_training_steps) # 10% Warmup
+
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, 
+        num_warmup_steps=num_warmup_steps, 
+        num_training_steps=num_training_steps
+    )
 
     if len(train_samples) > 0: 
         criterion_cls = FocalLoss(gamma=2.0, alpha=0.75).to(device)
     else: 
         criterion_cls = nn.CrossEntropyLoss().to(device)
 
-    train_sampler = DistributedSampler(train_ds, shuffle=True)
-    val_sampler = DistributedSampler(val_ds, shuffle=False)
-    
-    # 保证 DataLoader 的随机性在多卡间一致
-    g = torch.Generator()
-    g.manual_seed(0)
-    train_dl = DataLoader(train_ds, args.batch_size, sampler=train_sampler, num_workers=4, collate_fn=collate_fn, worker_init_fn=seed_worker, generator=g)
-    val_dl = DataLoader(val_ds, args.batch_size, sampler=val_sampler, num_workers=4, collate_fn=collate_fn, worker_init_fn=seed_worker, generator=g)
     
     best_val_f1 = 0.0
     start_epoch = 1
@@ -552,6 +565,7 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            scheduler.step()
             total_loss += loss.item()
 
             # 更新全局步数
@@ -622,7 +636,7 @@ def main():
             # 1. 保存每一轮的独立 Checkpoint
             logger.info(f" 正在写入模型")
             torch.save(state, Path(args.output_dir) / f"checkpoint_epoch_{epoch}.pt")
-            logger.info(f"  💾 Saved epoch checkpoint to {epoch_save_path}")
+            logger.info(f"  💾 Saved epoch checkpoint to checkpoint_epoch_{epoch}.pt")
 
             # Best model
             if v_f1 > best_val_f1:

@@ -152,7 +152,9 @@ class MotifGuidedSINEClassifier(nn.Module):
         # 全局分类头
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2), 
             nn.GELU(),
+            nn.Dropout(dropout),         
             nn.Linear(hidden_dim // 2, num_classes)
         )
 
@@ -255,7 +257,7 @@ class MotifGuidedSINEClassifier(nn.Module):
                 safe_sub_labels = sub_labels.clone().masked_fill(~sub_mask, 0)
                 
                 # 关闭混合精度以保证 CRF 数值稳定
-                with torch.cuda.amp.autocast(enabled=False):
+                with torch.amp.autocast('cuda', enabled=False):
                     log_likelihood = self.crf(sub_emissions.float(), safe_sub_labels, mask=sub_mask, reduction='sum')
                     num_valid_tokens = sub_mask.sum().float().clamp(min=1.0)
                     crf_loss = -log_likelihood / num_valid_tokens
