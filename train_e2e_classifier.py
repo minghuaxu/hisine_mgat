@@ -444,15 +444,16 @@ def main():
     crf_params = list(map(id, model.module.crf.parameters()))
     base_params = filter(lambda p: id(p) not in crf_params and p.requires_grad, model.parameters()) 
 
+    crf_lr = 1e-3
     optimizer = torch.optim.AdamW([
         {'params': base_params, 'lr': args.head_lr, 'weight_decay': 0.05},          # LoRA + Head
-        {'params': model.module.crf.parameters(), 'lr': 1e-3, 'weight_decay': 0.0} # CRF (需要较大 LR)
+        {'params': model.module.crf.parameters(), 'lr': crf_lr, 'weight_decay': 0.0} # CRF (需要较大 LR)
     ])
 
     #  添加 Scheduler (Cosine Decay 是目前最常用的)
     # 计算总步数
     num_training_steps = len(train_dl) * args.epochs
-    num_warmup_steps = int(0.1 * num_training_steps) # 10% Warmup
+    num_warmup_steps = int(0.2 * num_training_steps) # 10% Warmup
 
     scheduler = get_linear_schedule_with_warmup(
         optimizer, 
@@ -483,9 +484,9 @@ def main():
             set_backbone_freeze(model, freeze=True)
 
     # [技术 3] Loss 动态权重配置
-    # 目标：CRF 权重从 0 缓慢升至 0.1 (辅助地位)
+    # 目标：CRF 权重从 0 缓慢升至 0.05 (辅助地位)
     TARGET_CRF_WEIGHT = 0.05
-    CRF_WARMUP_EPOCHS = 3  # 前5个epoch逐渐增加权重
+    CRF_WARMUP_EPOCHS = 10  # 前10个epoch逐渐增加权重
 
     # =======================================================
     # 打印训练参数 & 初始化日志工具 (WandB)
@@ -497,7 +498,7 @@ def main():
         logger.info(f"  > Backbone      : {args.backbone_path}")
         logger.info(f"  > LoRA Config   : r={args.lora_r}, alpha={args.lora_alpha}")
         logger.info(f"  > Batch Size    : {args.batch_size} (Per GPU)")
-        logger.info(f"  > Learning Rate : Head={args.head_lr}, CRF=1e-3")
+        logger.info(f"  > Learning Rate : Head={args.head_lr}, CRF={crf_lr}")
         logger.info("-" * 60)
         logger.info(f"  > [Dynamic Weight Strategy]")
         logger.info(f"  > Target CRF Weight : {TARGET_CRF_WEIGHT}")

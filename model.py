@@ -108,7 +108,7 @@ class MotifGuidedSINEClassifier(nn.Module):
         backbone,
         hidden_dim: int = 256,
         num_classes: int = 2,
-        num_token_labels: int = 5,  # 0=Bg, 1=TSD, 2=Body, 3=PolyA, 4=Pad/-100
+        num_token_labels: int = 4,  # Recommended: 4 (0=Bg, 1=TSD, 2=Body, 3=PolyA)
         dropout: float = 0.1,
         freeze_backbone: bool = False
     ):
@@ -117,6 +117,7 @@ class MotifGuidedSINEClassifier(nn.Module):
         self.backbone = backbone
         self.backbone_dim = backbone.config.hidden_size
         self.num_classes = num_classes
+        self.num_token_labels = num_token_labels
         
         if freeze_backbone:
             for param in self.backbone.parameters():
@@ -243,24 +244,35 @@ class MotifGuidedSINEClassifier(nn.Module):
         crf_loss = torch.tensor(0.0, device=input_ids.device)
         
         if token_labels is not None and labels is not None:
-            # 筛选有效区域
-            valid_mask = (attention_mask.bool() & (token_labels != -100))
-            # 筛选正样本 (SINE)
-            pos_indices = (labels == 1).nonzero(as_tuple=True)[0]
-            
-            if len(pos_indices) > 0:
-                sub_emissions = emissions[pos_indices]
-                sub_labels = token_labels[pos_indices]
-                sub_mask = valid_mask[pos_indices]
-                
-                # 安全处理：Mask 掉的地方 label 设为 0 (虽不参与计算但 CRF 需要合法输入)
-                safe_sub_labels = sub_labels.clone().masked_fill(~sub_mask, 0)
-                
-                # 关闭混合精度以保证 CRF 数值稳定
-                with torch.amp.autocast('cuda', enabled=False):
-                    log_likelihood = self.crf(sub_emissions.float(), safe_sub_labels, mask=sub_mask, reduction='sum')
-                    num_valid_tokens = sub_mask.sum().float().clamp(min=1.0)
-                    crf_loss = -log_likelihood / num_valid_tokens
+            # 1. 准备 CRF Mask (直接使用 attention_mask)
+            crf_mask = attention_mask.bool()
+            # 2. 复制标签以进行修改 (Clone 是为了不影响 dataset 原始数据)
+            active_labels = token_labels.clone()
+
+            # 找出负样本的索引，将其序列标签强制设为 0 (Background)
+            neg_indices = (labels == 0).nonzero(as_tuple=True)[0]
+            if len(neg_indices) > 0:
+                # 仅修改 mask 为 True 的有效区域
+                neg_mask = crf_mask[neg_indices]
+                neg_targets = active_labels[neg_indices]
+                neg_targets[neg_mask] = 0 
+                active_labels[neg_indices] = neg_targets
+
+            # CRF 库不支持 -100。既然 mask 已经是 False (CRF会忽略该位置)，
+            # 我们将这些位置的值填为 0，单纯为了防止索引越界报错。
+            safe_labels = active_labels.masked_fill(~crf_mask, 0)
+            # 双重保险：限制在合法范围内
+            safe_labels = safe_labels.clamp(min=0, max=self.num_token_labels-1)
+
+            log_likelihood = self.crf(
+                    emissions.float(), 
+                    safe_labels, 
+                    mask=crf_mask, 
+                    reduction='sum'
+                )
+            # 除以有效 token 总数进行归一化
+            num_valid = crf_mask.sum().float().clamp(min=1.0)
+            crf_loss = -log_likelihood / num_valid
             
         return global_logits, emissions, crf_loss
 
