@@ -71,11 +71,14 @@ def build_mask_for_sample(seq_len, motif_row):
     return mask.astype(np.float32)
 
 class InferenceDataset(Dataset):
-    def __init__(self, data_list, motif_df, tokenizer, max_len=100): 
+    def __init__(self, data_list, motif_df, tokenizer, max_token_length=160, max_base_length=800): 
         self.data = data_list
         self.motif_df = motif_df.set_index('unique_id')
         self.tokenizer = tokenizer
-        self.max_len = max_len
+        # 使用双参数控制
+        self.max_token_length = max_token_length
+        self.max_base_length = max_base_length
+        
         self.cls_id = tokenizer.cls_token_id
         self.pad_id = tokenizer.pad_token_id
         
@@ -84,16 +87,28 @@ class InferenceDataset(Dataset):
     
     def __getitem__(self, idx):
         uid, seq = self.data[idx]
+        
+        # 1. 碱基长度截断 (Base Truncation)
+        # 推理时，如果序列过长，通常取中间可能更安全，或者直接从头截断
+        # 这里为了保持简单，从头截断
+        if len(seq) > self.max_base_length:
+            seq = seq[:self.max_base_length]
+
         if uid in self.motif_df.index:
             row = self.motif_df.loc[uid]
             base_mask = build_mask_for_sample(len(seq), row)
         else:
             base_mask = np.full(len(seq), 0.3, dtype=np.float32)
             
+        # 2. Tokenization
         content_ids = self.tokenizer.encode(seq, add_special_tokens=False)
-        if len(content_ids) > self.max_len - 1:
-            content_ids = content_ids[:self.max_len - 1]
+        
+        # 3. Token 长度截断 (预留 CLS 位)
+        target_token_len = self.max_token_length - 1
+        if len(content_ids) > target_token_len:
+            content_ids = content_ids[:target_token_len]
             
+        # Offset Mapping 计算
         mapping = []
         pos = 0
         for tid in content_ids:
@@ -105,10 +120,11 @@ class InferenceDataset(Dataset):
         elif pos > len(base_mask): 
             base_mask = np.concatenate([base_mask, np.full(pos-len(base_mask), 0.3)])
             
-        input_ids = torch.full((self.max_len,), self.pad_id, dtype=torch.long)
-        attention_mask = torch.zeros(self.max_len, dtype=torch.long)
-        token_mask = torch.zeros(self.max_len, dtype=torch.float32)
-        padded_mapping = torch.zeros((self.max_len, 2), dtype=torch.long)
+        # Padding
+        input_ids = torch.full((self.max_token_length,), self.pad_id, dtype=torch.long)
+        attention_mask = torch.zeros(self.max_token_length, dtype=torch.long)
+        token_mask = torch.zeros(self.max_token_length, dtype=torch.float32)
+        padded_mapping = torch.zeros((self.max_token_length, 2), dtype=torch.long)
         
         input_ids[0] = self.cls_id
         attention_mask[0] = 1
@@ -124,7 +140,6 @@ class InferenceDataset(Dataset):
             token_mask[token_idx] = float(np.max(seg)) if len(seg)>0 else 0.3
             padded_mapping[token_idx] = torch.tensor([s, e])
             
-        
         return {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
@@ -251,12 +266,14 @@ def main():
     parser.add_argument("--out_file", default="predictions.tsv")
     parser.add_argument("--out_fasta", default="predictions_refined.fasta")
     parser.add_argument("--temp_dir", default="temp_pred_workspace")
+    parser.add_argument("--max_token_length", type=int, default=160, help="Tensor dim")
+    parser.add_argument("--max_base_length", type=int, default=800, help="Base pairs context")
     parser.add_argument("--min_len", type=int, default=50, help="Minimum length for refined SINE sequences (default: 50)")
     args = parser.parse_args()
     
     # 1. 设置设备
-    # device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
-    device = torch.device( "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    # device = torch.device( "cpu")
     print(f"Using device: {device}")
 
     os.makedirs(args.temp_dir, exist_ok=True)
@@ -293,6 +310,10 @@ def main():
     print("Loading model...")
     tokenizer = AutoTokenizer.from_pretrained(args.backbone, trust_remote_code=True)
     backbone = AutoModelForMaskedLM.from_pretrained(args.backbone, trust_remote_code=True)
+
+    if backbone.get_input_embeddings().weight.shape[0] != len(tokenizer):
+        print(f"⚠️ Resizing embeddings to {len(tokenizer)}")
+        backbone.resize_token_embeddings(len(tokenizer))
     
     # 必须应用 LoRA，否则权重键名不匹配
     peft_config = LoraConfig(
@@ -358,7 +379,13 @@ def main():
     model.eval()
     
     # 4. 推理
-    ds = InferenceDataset(inference_data, motif_df, tokenizer, max_len=100)
+    ds = InferenceDataset(
+        inference_data, 
+        motif_df, 
+        tokenizer, 
+        max_token_length=args.max_token_length, # 使用参数，不再硬编码 100
+        max_base_length=args.max_base_length    # 使用参数
+    )
     dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
     
     results = []

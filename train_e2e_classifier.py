@@ -361,7 +361,7 @@ def main():
     parser.add_argument("--val_motif_tsv", default="", help="Optional")
     
     # 训练超参
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--freeze_epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--backbone_lr", type=float, default=5e-6)

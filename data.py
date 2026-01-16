@@ -93,7 +93,13 @@ class SINEDatasetE2E(Dataset):
         # -------------------------------------------------------------------------
         # [Step 1] 随机裁剪 (安全版)
         # -------------------------------------------------------------------------
-        target_char_len = self.max_token_length - 5 
+        # 修正逻辑：字符长度 = (Token数 - 安全余量) * k-mer大小
+        # 假设 k=6 (Nucleotide Transformer v2 默认是 6)
+        K_MER_SIZE = 6 
+        target_char_len = (self.max_token_length - 5) * K_MER_SIZE 
+        
+        # 现在的 target_char_len 如果 max_length=100，就是 95 * 6 = 570 bp
+        # 如果 max_length=512，就是 ~3000 bp5 
         seq_len = len(sequence)
         
         start_idx = 0
@@ -269,7 +275,9 @@ class SINEDatasetE2E(Dataset):
             'motif_mask': motif_mask,
             'token_labels': token_labels,
             'unique_id': unique_id,
-            'label': torch.tensor(label, dtype=torch.long)
+            'label': torch.tensor(label, dtype=torch.long),
+            'offset_mapping': torch.tensor(manual_offsets), 
+            'raw_sequence': sequence_cropped             
         }
 
 def collate_fn(batch):
@@ -279,6 +287,11 @@ def collate_fn(batch):
     token_labels = torch.stack([item['token_labels'] for item in batch])
     unique_ids = [item['unique_id'] for item in batch]
     labels = torch.stack([item['label'] for item in batch])
+
+    # 聚合 offset_mapping
+    offset_mapping = torch.stack([item['offset_mapping'] for item in batch])
+    # 聚合原始序列（用于预测脚本精准切片）
+    raw_sequences = [item['raw_sequence'] for item in batch]
     
     return {
         'input_ids': input_ids,
@@ -286,5 +299,7 @@ def collate_fn(batch):
         'motif_mask': motif_mask,
         'token_labels': token_labels,
         'unique_ids': unique_ids,
-        'label': labels
+        'label': labels,
+        'offset_mapping': offset_mapping,
+        'raw_sequence': raw_sequences
     }
