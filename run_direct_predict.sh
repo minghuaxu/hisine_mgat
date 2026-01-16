@@ -1,0 +1,11 @@
+python 08_direct_predict_from_csv.py \
+    --input_csv temp_pred_workspace/input_seqs.csv \
+    --motif_pos_tsv temp_pred_workspace/input_seqs.motif_pos.tsv \
+    --mask_pt temp_pred_workspace/input_seqs_mask.pt \
+    --model_path checkpoints/best_model.pt \
+    --backbone /home/xuminghua/sine_classifier/NT_finetuned_500M \
+    --output_dir ./my_predictions_20260115 \
+    --max_token_length 160 \
+    --max_base_length 800 \
+    --threshold 0.50 \
+    --min_len 100
